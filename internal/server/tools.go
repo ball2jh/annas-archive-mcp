@@ -23,26 +23,26 @@ import (
 
 // SearchInput defines the input schema for the search tool.
 type SearchInput struct {
-	Query       string `json:"query" jsonschema:"required,description=Search keywords"`
-	ContentType string `json:"content_type,omitempty" jsonschema:"description=Content type filter: book_any (default)\\, book_fiction\\, book_nonfiction\\, book_comic\\, journal\\, magazine\\, standards_document"`
-	Limit       int    `json:"limit,omitempty" jsonschema:"description=Maximum number of results to return (default 5\\, max 20)"`
+	Query       string `json:"query" jsonschema:"Search keywords"`
+	ContentType string `json:"content_type,omitempty" jsonschema:"Content type filter: book_any (default), book_fiction, book_nonfiction, book_comic, journal, magazine, standards_document"`
+	Limit       int    `json:"limit,omitempty" jsonschema:"Maximum number of results to return (default 5, max 20)"`
 }
 
 // DownloadInput defines the input schema for the download tool.
 type DownloadInput struct {
-	Hash   string `json:"hash" jsonschema:"required,description=MD5 hash from search results"`
-	Title  string `json:"title" jsonschema:"required,description=Title for the downloaded filename"`
-	Format string `json:"format" jsonschema:"required,description=File extension (pdf\\, epub\\, etc.)"`
+	Hash   string `json:"hash" jsonschema:"MD5 hash from search results"`
+	Title  string `json:"title" jsonschema:"Title for the downloaded filename"`
+	Format string `json:"format" jsonschema:"File extension (pdf, epub, etc.)"`
 }
 
 // DOIInput defines the input schema for the lookup_doi tool.
 type DOIInput struct {
-	DOI string `json:"doi" jsonschema:"required,description=DOI identifier (e.g. 10.1038/nature12373)"`
+	DOI string `json:"doi" jsonschema:"DOI identifier (e.g. 10.1038/nature12373)"`
 }
 
 // DetailsInput defines the input schema for the get_details tool.
 type DetailsInput struct {
-	Hash string `json:"hash" jsonschema:"required,description=MD5 hash of the item"`
+	Hash string `json:"hash" jsonschema:"MD5 hash of the item"`
 }
 
 // --- Default application ---
