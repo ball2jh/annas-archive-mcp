@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 )
@@ -42,10 +43,12 @@ func ResolveDownloadURL(ctx context.Context, client *httpclient.Client, hash, se
 // domain_index. It returns the download URL on success, or an error describing
 // why the request failed (including API-level error messages).
 func resolveSingle(ctx context.Context, client *httpclient.Client, hash, secretKey string, domainIndex int) (string, error) {
-	path := fmt.Sprintf(
-		"/dyn/api/fast_download.json?md5=%s&key=%s&path_index=0&domain_index=%d",
-		hash, secretKey, domainIndex,
-	)
+	params := url.Values{}
+	params.Set("md5", hash)
+	params.Set("key", secretKey)
+	params.Set("path_index", "0")
+	params.Set("domain_index", fmt.Sprintf("%d", domainIndex))
+	path := "/dyn/api/fast_download.json?" + params.Encode()
 
 	data, err := client.GetJSON(ctx, path, nil)
 	if err != nil {

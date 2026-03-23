@@ -49,6 +49,12 @@ func Search(
 		return nil, nil
 	}
 
+	// Trim to the requested limit before fetching stats to avoid
+	// unnecessary API calls for results that will be discarded.
+	if limit > 0 && len(results) > limit {
+		results = results[:limit]
+	}
+
 	// Collect unique MD5 hashes for parallel stats fetch.
 	hashes := make([]string, 0, len(results))
 	for _, r := range results {
@@ -64,11 +70,6 @@ func Search(
 				results[i].Stats = stats
 			}
 		}
-	}
-
-	// Trim to the requested limit.
-	if limit > 0 && len(results) > limit {
-		results = results[:limit]
 	}
 
 	return results, nil

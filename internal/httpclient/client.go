@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -113,7 +114,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 			// 403: check for DDoS-Guard, then return immediately (not retriable).
 			if c.isDDoSGuard(resp) {
 				c.logger.Warn("DDoS-Guard challenge detected — this IP may be blocked",
-					zap.String("url", req.URL.String()),
+					zap.String("url", sanitizeURL(req.URL)),
 				)
 			}
 			return resp, nil
@@ -124,7 +125,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 				zap.Int("statusCode", resp.StatusCode),
 				zap.Int("attempt", attempt+1),
 				zap.Int("maxAttempts", attempts),
-				zap.String("url", req.URL.String()),
+				zap.String("url", sanitizeURL(req.URL)),
 			)
 			lastErr = fmt.Errorf("httpclient: received status %d", resp.StatusCode)
 			continue
@@ -223,6 +224,21 @@ func NewForTest(httpClient *http.Client, baseURL string, logger *zap.Logger) *Cl
 		baseURL:    baseURL,
 		userAgent:  userAgent,
 	}
+}
+
+// sanitizeURL strips sensitive query parameters (like "key") from a URL for
+// safe logging. Returns the URL path and any non-sensitive query params.
+func sanitizeURL(u *url.URL) string {
+	if u == nil {
+		return "<nil>"
+	}
+	clean := *u
+	q := clean.Query()
+	if q.Has("key") {
+		q.Set("key", "REDACTED")
+	}
+	clean.RawQuery = q.Encode()
+	return clean.String()
 }
 
 // isDDoSGuard reads up to ddosGuardSniffLimit bytes from resp.Body, replaces

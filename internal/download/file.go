@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -46,6 +47,8 @@ func SanitizeFilename(title, format string) string {
 	name = strings.TrimSpace(string(runes))
 
 	if format != "" {
+		// Sanitize the format extension too (remove path separators, etc.).
+		format = invalidChars.Replace(strings.TrimSpace(format))
 		return name + "." + format
 	}
 	return name
@@ -79,7 +82,7 @@ func AtomicWrite(dir, filename string, r io.Reader) (string, error) {
 		return "", fmt.Errorf("download: close temp file: %w", err)
 	}
 
-	finalPath := dir + string(os.PathSeparator) + filename
+	finalPath := filepath.Join(dir, filename)
 	if err := os.Rename(tmpName, finalPath); err != nil {
 		return "", fmt.Errorf("download: rename to final path: %w", err)
 	}

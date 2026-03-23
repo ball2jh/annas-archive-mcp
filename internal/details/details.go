@@ -48,10 +48,15 @@ func GetDetails(ctx context.Context, client *httpclient.Client, logger *zap.Logg
 
 	stats, err := api.FetchStats(ctx, client, hash)
 	if err != nil {
-		return nil, fmt.Errorf("details: fetch stats for %q: %w", hash, err)
+		// Soft-fail: stats are supplementary. Log the error but return
+		// the metadata we already scraped rather than failing the whole call.
+		logger.Warn("details: stats unavailable, returning metadata without stats",
+			zap.String("hash", hash),
+			zap.Error(err),
+		)
+	} else {
+		result.Stats = stats
 	}
-
-	result.Stats = stats
 
 	return result, nil
 }
