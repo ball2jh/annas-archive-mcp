@@ -77,7 +77,7 @@ func searchHandler(cfg *config.Config, client *httpclient.Client, logger *zap.Lo
 		results, err := search.Search(ctx, client, logger, input.Query, model.ContentType(input.ContentType), input.Limit)
 		if err != nil {
 			logger.Error("search failed", zap.Error(err))
-			return nil, nil, fmt.Errorf("Search failed — the server may be temporarily unavailable.")
+			return nil, nil, fmt.Errorf("[SEARCH_FAILED] Search failed — the server may be temporarily unavailable.")
 		}
 
 		text := formatSearchResults(results)
@@ -92,11 +92,14 @@ func downloadHandler(cfg *config.Config, client *httpclient.Client, logger *zap.
 		result, err := download.Download(ctx, client, logger, cfg, input.Hash, input.Title, input.Format)
 		if err != nil {
 			logger.Error("download failed", zap.Error(err))
-			// Surface config-related errors directly since they are user-actionable.
-			if strings.Contains(err.Error(), "ANNAS_SECRET_KEY") || strings.Contains(err.Error(), "ANNAS_DOWNLOAD_PATH") {
-				return nil, nil, err
+			// Surface config-related errors with structured codes since they are user-actionable.
+			if strings.Contains(err.Error(), "ANNAS_SECRET_KEY") {
+				return nil, nil, fmt.Errorf("[AUTH_REQUIRED] %s", err.Error())
 			}
-			return nil, nil, fmt.Errorf("Download failed — please try again.")
+			if strings.Contains(err.Error(), "ANNAS_DOWNLOAD_PATH") {
+				return nil, nil, fmt.Errorf("[PATH_REQUIRED] %s", err.Error())
+			}
+			return nil, nil, fmt.Errorf("[DOWNLOAD_FAILED] Download failed — please try again.")
 		}
 
 		text := fmt.Sprintf("%s\nFile saved to: %s", result.Message, result.FilePath)
@@ -111,11 +114,11 @@ func doiHandler(cfg *config.Config, client *httpclient.Client, logger *zap.Logge
 		result, err := doi.Resolve(ctx, client, logger, input.DOI)
 		if err != nil {
 			logger.Error("DOI lookup failed", zap.Error(err))
-			// Surface validation errors directly since they are user-actionable.
+			// Surface validation errors with structured codes since they are user-actionable.
 			if strings.Contains(err.Error(), "invalid DOI") {
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("[INVALID_DOI] %s", err.Error())
 			}
-			return nil, nil, fmt.Errorf("DOI lookup failed — please verify the DOI and try again.")
+			return nil, nil, fmt.Errorf("[DOI_LOOKUP_FAILED] DOI lookup failed — please verify the DOI and try again.")
 		}
 
 		text := formatDOIResult(result)
@@ -130,11 +133,11 @@ func detailsHandler(cfg *config.Config, client *httpclient.Client, logger *zap.L
 		result, err := details.GetDetails(ctx, client, logger, input.Hash)
 		if err != nil {
 			logger.Error("get details failed", zap.Error(err))
-			// Surface validation errors directly since they are user-actionable.
+			// Surface validation errors with structured codes since they are user-actionable.
 			if strings.Contains(err.Error(), "invalid hash") {
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("[INVALID_HASH] %s", err.Error())
 			}
-			return nil, nil, fmt.Errorf("Could not retrieve details — please verify the hash and try again.")
+			return nil, nil, fmt.Errorf("[DETAILS_FAILED] Could not retrieve details — please verify the hash and try again.")
 		}
 
 		text := formatDetails(result)

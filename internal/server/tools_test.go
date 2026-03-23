@@ -1,10 +1,19 @@
 package server
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"go.uber.org/zap/zaptest"
+
+	"github.com/ball2jh/annas-archive-mcp/internal/config"
+	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 	"github.com/ball2jh/annas-archive-mcp/internal/model"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestApplySearchDefaults(t *testing.T) {
@@ -226,5 +235,146 @@ func TestValueOr(t *testing.T) {
 	}
 	if got := valueOr("", "—"); got != "—" {
 		t.Errorf("got %q, want %q", got, "—")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Error boundary tests
+// ---------------------------------------------------------------------------
+
+// newErrorBoundaryClient creates a Client wired to a TLS test server, matching
+// the pattern used throughout the test suite.
+func newErrorBoundaryClient(t *testing.T, srv *httptest.Server) *httpclient.Client {
+	t.Helper()
+	hc := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: srv.Client().Transport,
+	}
+	return httpclient.NewForTest(hc, srv.Listener.Addr().String(), zaptest.NewLogger(t))
+}
+
+// TestSearchHandlerErrorBoundary verifies that when the upstream server returns
+// 500, the handler returns [SEARCH_FAILED] and does NOT leak the server URL or
+// status code to the caller.
+func TestSearchHandlerErrorBoundary(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{}
+	client := newErrorBoundaryClient(t, srv)
+	logger := zaptest.NewLogger(t)
+
+	handler := searchHandler(cfg, client, logger)
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, SearchInput{Query: "python"})
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "[SEARCH_FAILED]") {
+		t.Errorf("error does not contain [SEARCH_FAILED]: %q", msg)
+	}
+	// Internal details must not leak to the caller.
+	if strings.Contains(msg, srv.URL) {
+		t.Errorf("error leaks server URL: %q", msg)
+	}
+	if strings.Contains(msg, "500") {
+		t.Errorf("error leaks status code: %q", msg)
+	}
+}
+
+// TestDownloadHandlerMissingKey verifies that calling the download handler
+// without a configured SecretKey returns [AUTH_REQUIRED].
+func TestDownloadHandlerMissingKey(t *testing.T) {
+	// No HTTP server needed — the handler fails on config validation before any
+	// network call is made.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("unexpected HTTP request — should have failed before making any request")
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{SecretKey: "", DownloadPath: "/tmp"}
+	client := newErrorBoundaryClient(t, srv)
+	logger := zaptest.NewLogger(t)
+
+	handler := downloadHandler(cfg, client, logger)
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, DownloadInput{Hash: "abc", Title: "test", Format: "pdf"})
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "[AUTH_REQUIRED]") {
+		t.Errorf("error does not contain [AUTH_REQUIRED]: %q", err.Error())
+	}
+}
+
+// TestDownloadHandlerMissingPath verifies that calling the download handler
+// with a SecretKey but no DownloadPath returns [PATH_REQUIRED].
+func TestDownloadHandlerMissingPath(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("unexpected HTTP request — should have failed before making any request")
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{SecretKey: "secret", DownloadPath: ""}
+	client := newErrorBoundaryClient(t, srv)
+	logger := zaptest.NewLogger(t)
+
+	handler := downloadHandler(cfg, client, logger)
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, DownloadInput{Hash: "abc", Title: "test", Format: "pdf"})
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "[PATH_REQUIRED]") {
+		t.Errorf("error does not contain [PATH_REQUIRED]: %q", err.Error())
+	}
+}
+
+// TestDOIHandlerInvalidDOI verifies that passing a non-DOI string returns
+// [INVALID_DOI] without making any network requests.
+func TestDOIHandlerInvalidDOI(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("unexpected HTTP request — should have failed before making any request")
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{}
+	client := newErrorBoundaryClient(t, srv)
+	logger := zaptest.NewLogger(t)
+
+	handler := doiHandler(cfg, client, logger)
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, DOIInput{DOI: "not-a-doi"})
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "[INVALID_DOI]") {
+		t.Errorf("error does not contain [INVALID_DOI]: %q", err.Error())
+	}
+}
+
+// TestDetailsHandlerInvalidHash verifies that passing a short hash string
+// returns [INVALID_HASH] without making any network requests.
+func TestDetailsHandlerInvalidHash(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("unexpected HTTP request — should have failed before making any request")
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{}
+	client := newErrorBoundaryClient(t, srv)
+	logger := zaptest.NewLogger(t)
+
+	handler := detailsHandler(cfg, client, logger)
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, DetailsInput{Hash: "xyz"})
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "[INVALID_HASH]") {
+		t.Errorf("error does not contain [INVALID_HASH]: %q", err.Error())
 	}
 }
