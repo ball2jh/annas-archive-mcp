@@ -211,6 +211,20 @@ func (c *Client) GetJSON(ctx context.Context, path string, headers map[string]st
 	return data, nil
 }
 
+// NewForTest creates a Client suitable for unit tests. baseURL should be the
+// httptest server address without a scheme (e.g. "127.0.0.1:PORT"). The
+// provided httpClient can carry a custom transport that routes HTTPS requests
+// to the plain-HTTP test server.
+func NewForTest(httpClient *http.Client, baseURL string, logger *zap.Logger) *Client {
+	return &Client{
+		http:       httpClient,
+		logger:     logger,
+		maxRetries: 0,
+		baseURL:    baseURL,
+		userAgent:  userAgent,
+	}
+}
+
 // isDDoSGuard reads up to ddosGuardSniffLimit bytes from resp.Body, replaces
 // the body with a reader over those bytes so callers can still read it, and
 // reports whether the DDoS-Guard marker was present.
