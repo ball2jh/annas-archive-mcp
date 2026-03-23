@@ -1,6 +1,6 @@
 # annas-archive-mcp
 
-MCP server for searching, downloading, and looking up content on [Anna's Archive](https://annas-archive.gl). Built in Go, designed for use with Claude Code and other MCP-compatible clients.
+MCP server for searching, downloading, and looking up content on Anna's Archive. Built in Go, designed for use with Claude Code and other MCP-compatible clients.
 
 ## Tools
 
