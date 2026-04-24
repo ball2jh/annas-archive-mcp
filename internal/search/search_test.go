@@ -40,10 +40,10 @@ func loadSearchHTML(t *testing.T) []byte {
 // inlineInfoJSON returns minimal JSON for the inline_info endpoint.
 func inlineInfoJSON(downloads int) []byte {
 	v := map[string]int{
-		"downloads_total":    downloads,
-		"lists_count":        1,
-		"comments_count":     0,
-		"reports_count":      0,
+		"downloads_total":     downloads,
+		"lists_count":         1,
+		"comments_count":      0,
+		"reports_count":       0,
 		"great_quality_count": 2,
 	}
 	b, _ := json.Marshal(v)
@@ -135,8 +135,8 @@ func TestSearchInvalidContentType(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid content type, got nil")
 	}
-	if !strings.Contains(err.Error(), "invalid content type") {
-		t.Errorf("error %q does not mention 'invalid content type'", err.Error())
+	if !strings.Contains(err.Error(), "[INVALID_CONTENT_TYPE]") {
+		t.Errorf("error %q does not contain [INVALID_CONTENT_TYPE]", err.Error())
 	}
 }
 

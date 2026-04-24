@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,46 @@ func TestFormatSearchResults(t *testing.T) {
 	}
 	if !strings.Contains(got, "3,486") {
 		t.Errorf("missing formatted download count, got:\n%s", got)
+	}
+}
+
+func TestSearchHandlerReturnsStructuredOutput(t *testing.T) {
+	const hash = "f87448722f0072549206b63999ec39e1"
+	htmlBody, err := os.ReadFile("../../testdata/search_results.html")
+	if err != nil {
+		t.Fatalf("read search fixture: %v", err)
+	}
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/search":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write(htmlBody)
+		case r.URL.Path == "/dyn/md5/inline_info/"+hash:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"downloads_total": 7, "lists_count": 1, "comments_count": 0, "reports_count": 0, "great_quality_count": 0}`))
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{}
+	client := newErrorBoundaryClient(t, srv)
+	handler := searchHandler(cfg, client, zaptest.NewLogger(t))
+
+	res, out, err := handler(context.Background(), &mcp.CallToolRequest{}, SearchInput{Query: "example", Limit: 1})
+	if err != nil {
+		t.Fatalf("handler returned error: %v", err)
+	}
+	if res == nil || len(res.Content) == 0 {
+		t.Fatal("expected text content")
+	}
+	if out.Count != 1 {
+		t.Fatalf("Count = %d, want 1", out.Count)
+	}
+	if out.Results[0].Hash != hash {
+		t.Fatalf("Hash = %q, want %q", out.Results[0].Hash, hash)
 	}
 }
 
@@ -254,8 +295,8 @@ func newErrorBoundaryClient(t *testing.T, srv *httptest.Server) *httpclient.Clie
 }
 
 // TestSearchHandlerErrorBoundary verifies that when the upstream server returns
-// 500, the handler returns [SEARCH_FAILED] and does NOT leak the server URL or
-// status code to the caller.
+// 500, the handler returns a classified public error and does NOT leak the
+// server URL or status code to the caller.
 func TestSearchHandlerErrorBoundary(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -273,8 +314,8 @@ func TestSearchHandlerErrorBoundary(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "[SEARCH_FAILED]") {
-		t.Errorf("error does not contain [SEARCH_FAILED]: %q", msg)
+	if !strings.Contains(msg, "[UPSTREAM_UNAVAILABLE]") {
+		t.Errorf("error does not contain [UPSTREAM_UNAVAILABLE]: %q", msg)
 	}
 	// Internal details must not leak to the caller.
 	if strings.Contains(msg, srv.URL) {
@@ -285,22 +326,166 @@ func TestSearchHandlerErrorBoundary(t *testing.T) {
 	}
 }
 
-// TestDownloadHandlerMissingKey verifies that calling the download handler
-// without a configured SecretKey returns [AUTH_REQUIRED].
+func TestToolErrorClassifiesCommonFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation string
+		err       error
+		wantCode  string
+	}{
+		{
+			name:      "ddos guard",
+			operation: "search",
+			err:       &httpclient.StatusError{StatusCode: http.StatusForbidden, DDoSGuard: true},
+			wantCode:  "[UPSTREAM_BLOCKED]",
+		},
+		{
+			name:      "rate limit",
+			operation: "search",
+			err:       &httpclient.StatusError{StatusCode: http.StatusTooManyRequests},
+			wantCode:  "[RATE_LIMITED]",
+		},
+		{
+			name:      "details not found",
+			operation: "details",
+			err:       &httpclient.StatusError{StatusCode: http.StatusNotFound},
+			wantCode:  "[NOT_FOUND]",
+		},
+		{
+			name:      "server unavailable",
+			operation: "search",
+			err:       &httpclient.StatusError{StatusCode: http.StatusBadGateway},
+			wantCode:  "[UPSTREAM_UNAVAILABLE]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := toolError(tt.operation, tt.err).Error()
+			if !strings.Contains(got, tt.wantCode) {
+				t.Fatalf("toolError() = %q, want code %s", got, tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestToolRateLimit(t *testing.T) {
+	cfg := &config.Config{ToolRateLimitPerMinute: 1}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("invalid DOI should not make network requests")
+	}))
+	defer srv.Close()
+
+	handler := doiHandler(cfg, newErrorBoundaryClient(t, srv), zaptest.NewLogger(t))
+
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, DOIInput{DOI: "bad"})
+	if err == nil || !strings.Contains(err.Error(), "[INVALID_DOI]") {
+		t.Fatalf("first call error = %v, want [INVALID_DOI]", err)
+	}
+
+	_, _, err = handler(context.Background(), &mcp.CallToolRequest{}, DOIInput{DOI: "bad"})
+	if err == nil || !strings.Contains(err.Error(), "[LOCAL_RATE_LIMITED]") {
+		t.Fatalf("second call error = %v, want [LOCAL_RATE_LIMITED]", err)
+	}
+}
+
+func TestToolAnnotations(t *testing.T) {
+	srv := New(&config.Config{}, nil, zaptest.NewLogger(t))
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+
+	serverSession, err := srv.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.0.1"}, nil)
+	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	tools, err := clientSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+
+	byName := make(map[string]*mcp.Tool, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		byName[tool.Name] = tool
+	}
+
+	for _, name := range []string{"search", "lookup_doi", "get_details"} {
+		tool := byName[name]
+		if tool == nil {
+			t.Fatalf("missing tool %q", name)
+		}
+		if tool.Title == "" {
+			t.Fatalf("%s has empty title", name)
+		}
+		if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
+			t.Fatalf("%s should be annotated read-only", name)
+		}
+		if tool.Annotations.OpenWorldHint == nil || !*tool.Annotations.OpenWorldHint {
+			t.Fatalf("%s should be annotated open-world", name)
+		}
+		if tool.OutputSchema == nil {
+			t.Fatalf("%s should expose an output schema", name)
+		}
+	}
+
+	for _, name := range []string{"download", "download_by_doi"} {
+		tool := byName[name]
+		if tool == nil {
+			t.Fatalf("missing tool %q", name)
+		}
+		if tool.Title == "" {
+			t.Fatalf("%s has empty title", name)
+		}
+		if tool.Annotations == nil {
+			t.Fatalf("%s missing annotations", name)
+		}
+		if tool.Annotations.ReadOnlyHint {
+			t.Fatalf("%s should not be read-only", name)
+		}
+		if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint {
+			t.Fatalf("%s should be annotated non-destructive/additive", name)
+		}
+		if !tool.Annotations.IdempotentHint {
+			t.Fatalf("%s should be annotated idempotent", name)
+		}
+		if tool.Annotations.OpenWorldHint == nil || !*tool.Annotations.OpenWorldHint {
+			t.Fatalf("%s should be annotated open-world", name)
+		}
+		if tool.OutputSchema == nil {
+			t.Fatalf("%s should expose an output schema", name)
+		}
+	}
+}
+
+// TestDownloadHandlerMissingKey verifies that when ANNAS_SECRET_KEY is empty
+// AND the libgen.li fallback is disabled, the handler returns [AUTH_REQUIRED].
+// Uses a valid 32-char hex hash so we reach the key check rather than fail at
+// input validation.
 func TestDownloadHandlerMissingKey(t *testing.T) {
-	// No HTTP server needed — the handler fails on config validation before any
-	// network call is made.
+	// No HTTP server needed — the handler fails before any network call.
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("unexpected HTTP request — should have failed before making any request")
 	}))
 	defer srv.Close()
 
-	cfg := &config.Config{SecretKey: "", DownloadPath: "/tmp"}
+	cfg := &config.Config{
+		SecretKey:     "",
+		DownloadPath:  "/tmp",
+		LibgenEnabled: false, // opt out of fallback so the missing key is fatal
+	}
 	client := newErrorBoundaryClient(t, srv)
 	logger := zaptest.NewLogger(t)
 
 	handler := downloadHandler(cfg, client, logger)
-	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, DownloadInput{Hash: "abc", Title: "test", Format: "pdf"})
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{},
+		DownloadInput{Hash: "0123456789abcdef0123456789abcdef", Title: "test", Format: "pdf"})
 
 	if err == nil {
 		t.Fatal("expected error, got nil")

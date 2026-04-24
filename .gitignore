@@ -1,6 +1,11 @@
 # Build output
 annas-archive-mcp
 *.exe
+downloads/
+
+# MCP server config — may contain ANNAS_SECRET_KEY or other credentials
+.mcp.json
+.mcp.local.json
 
 # Editor/IDE
 .idea/

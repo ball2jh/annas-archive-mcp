@@ -134,6 +134,27 @@ func TestGetDetailsSuccess(t *testing.T) {
 	if result.Stats.Quality != "5" {
 		t.Errorf("stats.quality = %q, want '5'", result.Stats.Quality)
 	}
+	if strings.Contains(result.Description, "lgli/") ||
+		strings.Contains(result.Description, "lgrsnf/") ||
+		strings.Contains(result.Description, "zlib/") {
+		t.Errorf("description still contains source metadata: %q", result.Description)
+	}
+}
+
+func TestCleanDescriptionKeepsHumanText(t *testing.T) {
+	raw := strings.Join([]string{
+		"lgli/File Name.epub",
+		"zlib/Computers/Book.pdf",
+		"lg12345",
+		"2021-08-16",
+		"A concise human-readable description.",
+	}, "\n")
+
+	got := cleanDescription(raw)
+	want := "A concise human-readable description."
+	if got != want {
+		t.Errorf("cleanDescription() = %q, want %q", got, want)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +171,8 @@ func TestGetDetailsInvalidHash(t *testing.T) {
 		{"empty string", ""},
 		{"too short", "short"},
 		{"not hex", "not-hex-at-all!!!!!!!!!!!!!!!"},
-		{"31 chars", "f87448722f0072549206b63999ec39e"},  // one char short
-		{"33 chars", "f87448722f0072549206b63999ec39e1a"}, // one char over
+		{"31 chars", "f87448722f0072549206b63999ec39e"},                   // one char short
+		{"33 chars", "f87448722f0072549206b63999ec39e1a"},                 // one char over
 		{"uppercase valid but wrong", "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"}, // 32 non-hex
 	}
 

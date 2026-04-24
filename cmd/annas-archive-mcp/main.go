@@ -28,6 +28,16 @@ func main() {
 	}
 	defer logger.Sync() //nolint:errcheck
 
+	// Search / details / doi work without download config. Downloads require
+	// ANNAS_DOWNLOAD_PATH; ANNAS_SECRET_KEY enables Anna's fast_download tier,
+	// but Libgen and Sci-Net fallbacks can still work without it.
+	if cfg.SecretKey == "" {
+		logger.Warn("ANNAS_SECRET_KEY is not set — Anna's fast_download tier will be skipped")
+	}
+	if cfg.DownloadPath == "" {
+		logger.Warn("ANNAS_DOWNLOAD_PATH is not set — download tools will fail until this is configured")
+	}
+
 	client := httpclient.New(cfg, logger)
 	srv := server.New(cfg, client, logger)
 

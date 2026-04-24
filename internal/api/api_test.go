@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -221,8 +222,8 @@ func TestResolveDownloadURLError(t *testing.T) {
 	}
 	// The original API error message must be preserved somewhere in the chain.
 	const wantMsg = "Invalid secret key"
-	if !containsString(err.Error(), wantMsg) {
-		t.Errorf("error %q does not contain %q", err.Error(), wantMsg)
+	if !chainContains(err, wantMsg) {
+		t.Errorf("error chain %q does not contain %q", err.Error(), wantMsg)
 	}
 }
 
@@ -261,6 +262,60 @@ func TestResolveDownloadURLFallback(t *testing.T) {
 	}
 }
 
+// TestResolveDownloadURLNotFastDownloadable verifies the API's "Invalid
+// domain_index or path_index" error (returned with HTTP 400 when a file is
+// only in external collections) is classified as NOT_FAST_DOWNLOADABLE and
+// carries a message linking to the manual download page.
+func TestResolveDownloadURLNotFastDownloadable(t *testing.T) {
+	const hash = "4693089fb653fcaab65ba10d800593ea"
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// All domain_index values fail with HTTP 400 and a JSON error body.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, `{"download_url": null, "error": "Invalid domain_index or path_index"}`)
+	}))
+	defer srv.Close()
+
+	client := newAPITestClient(t, srv)
+	_, err := ResolveDownloadURL(context.Background(), client, hash, "mykey")
+	if err == nil {
+		t.Fatal("expected NOT_FAST_DOWNLOADABLE error, got nil")
+	}
+
+	if !chainContains(err, "NOT_FAST_DOWNLOADABLE") {
+		t.Errorf("expected NOT_FAST_DOWNLOADABLE code in error chain, got: %v", err)
+	}
+	if !chainContains(err, hash) {
+		t.Errorf("expected hash %q in error message (for manual-download link), got: %v", hash, err)
+	}
+}
+
+// TestResolveDownloadURLUnknownAPIError verifies that unknown API error strings
+// are surfaced verbatim as UPSTREAM_API_ERROR, rather than masked by the
+// generic DOWNLOAD_FAILED fallback.
+func TestResolveDownloadURLUnknownAPIError(t *testing.T) {
+	const apiMsg = "Some new error Anna's Archive added in 2027"
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"download_url": null, "error": %q}`+"\n", apiMsg)
+	}))
+	defer srv.Close()
+
+	client := newAPITestClient(t, srv)
+	_, err := ResolveDownloadURL(context.Background(), client, "abc", "key")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !chainContains(err, "UPSTREAM_API_ERROR") {
+		t.Errorf("want UPSTREAM_API_ERROR code in chain, got: %v", err)
+	}
+	if !chainContains(err, apiMsg) {
+		t.Errorf("want raw API message %q preserved in chain, got: %v", apiMsg, err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -275,4 +330,14 @@ func containsString(s, sub string) bool {
 			}
 			return false
 		}())
+}
+
+func chainContains(err error, sub string) bool {
+	for err != nil {
+		if containsString(err.Error(), sub) {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }

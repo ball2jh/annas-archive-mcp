@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"go.uber.org/zap"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 	"github.com/ball2jh/annas-archive-mcp/internal/model"
 	"github.com/ball2jh/annas-archive-mcp/internal/scraper"
+	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
 const maxConcurrency = 10
@@ -33,8 +35,11 @@ func Search(
 	contentType model.ContentType,
 	limit int,
 ) ([]model.SearchResult, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, usererror.New("INVALID_QUERY", "Search query is required.")
+	}
 	if !model.ValidContentType(contentType) {
-		return nil, fmt.Errorf("search: invalid content type %q", contentType)
+		return nil, usererror.New("INVALID_CONTENT_TYPE", fmt.Sprintf("content_type must be one of: %s.", validContentTypes()))
 	}
 
 	path := buildSearchPath(query, contentType, limit)
@@ -73,6 +78,19 @@ func Search(
 	}
 
 	return results, nil
+}
+
+func validContentTypes() string {
+	values := []string{
+		string(model.ContentTypeBookAny),
+		string(model.ContentTypeBookFiction),
+		string(model.ContentTypeBookNonfiction),
+		string(model.ContentTypeBookComic),
+		string(model.ContentTypeJournal),
+		string(model.ContentTypeMagazine),
+		string(model.ContentTypeStandardsDocument),
+	}
+	return strings.Join(values, ", ")
 }
 
 // buildSearchPath constructs the /search query path from the provided

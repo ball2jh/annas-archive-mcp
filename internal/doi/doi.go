@@ -11,6 +11,7 @@ import (
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 	"github.com/ball2jh/annas-archive-mcp/internal/model"
 	"github.com/ball2jh/annas-archive-mcp/internal/scraper"
+	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
 // Resolve looks up a DOI on Anna's Archive and returns paper metadata.
@@ -70,10 +71,10 @@ func cleanDOI(raw string) (string, error) {
 	doi = strings.TrimSpace(doi)
 
 	if !strings.HasPrefix(doi, "10.") {
-		return "", fmt.Errorf("doi: invalid DOI %q: must start with \"10.\"", raw)
+		return "", usererror.New("INVALID_DOI", "DOI must start with \"10.\".")
 	}
 	if !strings.Contains(doi, "/") {
-		return "", fmt.Errorf("doi: invalid DOI %q: must contain \"/\"", raw)
+		return "", usererror.New("INVALID_DOI", "DOI must contain a slash, for example 10.1038/nature12373.")
 	}
 
 	return doi, nil

@@ -43,13 +43,13 @@ type CommunityStats struct {
 
 // SearchResult is a single entry returned by the search tool.
 type SearchResult struct {
-	Title   string         `json:"title"`
-	Authors []string       `json:"authors"`
-	Format  string         `json:"format"`
-	Size    string         `json:"size"`
-	Language string        `json:"language"`
-	Hash    string         `json:"hash"` // MD5
-	Stats   CommunityStats `json:"stats"`
+	Title    string         `json:"title"`
+	Authors  []string       `json:"authors"`
+	Format   string         `json:"format"`
+	Size     string         `json:"size"`
+	Language string         `json:"language"`
+	Hash     string         `json:"hash"` // MD5
+	Stats    CommunityStats `json:"stats"`
 }
 
 // BookDetails holds the extended metadata returned by the get_details tool.
@@ -83,4 +83,12 @@ type DOIResult struct {
 type DownloadResult struct {
 	FilePath string `json:"file_path"`
 	Message  string `json:"message"`
+
+	// AlreadyExisted is true when the target file was already present on disk
+	// and the download was skipped. When true, no API quota was consumed.
+	AlreadyExisted bool `json:"already_existed,omitempty"`
+
+	// Source names the tier that delivered the file: "fast_download",
+	// "libgen.li", or "cache" for skip-if-exists hits. Empty when unknown.
+	Source string `json:"source,omitempty"`
 }

@@ -45,6 +45,36 @@ type Client struct {
 	userAgent  string
 }
 
+// StatusError reports a non-OK upstream HTTP response. It intentionally keeps
+// the raw path/status available for logs while allowing callers to classify the
+// failure without parsing strings.
+//
+// RetryAfter carries a parsed Retry-After hint from the server when present
+// (0 otherwise). Tool-level handlers use it to tell the user exactly how long
+// to wait before retrying — the `httpclient.Do` loop has already waited for
+// the hint when applicable, so callers see it as context, not as a requirement.
+type StatusError struct {
+	Operation  string
+	Path       string
+	StatusCode int
+	DDoSGuard  bool
+	RetryAfter time.Duration
+}
+
+func (e *StatusError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.DDoSGuard {
+		return fmt.Sprintf("httpclient: %s %s: upstream DDoS-Guard challenge", e.Operation, e.Path)
+	}
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("httpclient: %s %s: status %d (Retry-After %s)",
+			e.Operation, e.Path, e.StatusCode, e.RetryAfter.Round(time.Second))
+	}
+	return fmt.Sprintf("httpclient: %s %s: unexpected status %d", e.Operation, e.Path, e.StatusCode)
+}
+
 // New creates a Client configured from cfg. The underlying *http.Client uses
 // cfg.HTTPTimeout as its per-request deadline.
 func New(cfg *config.Config, logger *zap.Logger) *Client {
@@ -71,15 +101,23 @@ func New(cfg *config.Config, logger *zap.Logger) *Client {
 // The caller is responsible for closing the response body on success.
 func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
 	var (
-		resp     *http.Response
-		lastErr  error
-		attempts = c.maxRetries + 1 // first attempt + retries
+		resp           *http.Response
+		lastErr        error
+		lastRetryAfter time.Duration
+		attempts       = c.maxRetries + 1 // first attempt + retries
 	)
 
 	for attempt := 0; attempt < attempts; attempt++ {
-		// Wait before each retry (not before the first attempt).
+		// Wait before each retry (not before the first attempt). Honor any
+		// server Retry-After hint from the previous response.
 		if attempt > 0 {
-			wait := backoffDuration(attempt-1) // attempt-1 so first retry uses exponent 0
+			wait := retryWait(backoffDuration(attempt-1), lastRetryAfter)
+			// Fail fast when the requested wait would exceed the context
+			// deadline — don't burn time we don't have.
+			if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait {
+				return nil, fmt.Errorf("httpclient: Retry-After (%s) exceeds remaining context deadline: %w",
+					wait.Round(time.Second), context.DeadlineExceeded)
+			}
 			select {
 			case <-ctx.Done():
 				return nil, fmt.Errorf("httpclient: context cancelled while waiting for retry: %w", ctx.Err())
@@ -101,6 +139,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 		resp, lastErr = c.http.Do(cloned) //nolint:bodyclose // caller closes on success
 		if lastErr != nil {
 			// Network / timeout error — always retriable.
+			lastRetryAfter = 0 // no header to honor on a network failure
 			c.logger.Warn("httpclient: request error, will retry",
 				zap.Int("attempt", attempt+1),
 				zap.Int("maxAttempts", attempts),
@@ -120,14 +159,22 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 			return resp, nil
 
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
-			// Retriable status codes.
+			// Retriable status codes. Extract any Retry-After hint so the next
+			// iteration can wait at least that long.
+			lastRetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 			c.logger.Warn("httpclient: retriable status, will retry",
 				zap.Int("statusCode", resp.StatusCode),
 				zap.Int("attempt", attempt+1),
 				zap.Int("maxAttempts", attempts),
+				zap.Duration("retryAfter", lastRetryAfter),
 				zap.String("url", sanitizeURL(req.URL)),
 			)
-			lastErr = fmt.Errorf("httpclient: received status %d", resp.StatusCode)
+			lastErr = &StatusError{
+				Operation:  "request",
+				Path:       sanitizeURL(req.URL),
+				StatusCode: resp.StatusCode,
+				RetryAfter: lastRetryAfter,
+			}
 			continue
 
 		default:
@@ -178,7 +225,7 @@ func (c *Client) GetHTML(ctx context.Context, path string) (*goquery.Document, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("httpclient: GetHTML %s: unexpected status %d", path, resp.StatusCode)
+		return nil, StatusErrorFromResponse("GetHTML", path, resp)
 	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
@@ -190,26 +237,47 @@ func (c *Client) GetHTML(ctx context.Context, path string) (*goquery.Document, e
 }
 
 // GetJSON fetches https://{BaseURL}+path with optional headers and returns the
-// raw response bytes. The response body is closed before returning.
+// raw response bytes. The response body is closed before returning. Non-200
+// responses are converted to *StatusError and the body is discarded. Callers
+// that need to inspect an error body (e.g. the fast_download API returns a
+// structured JSON error on HTTP 400) should use GetJSONStatus instead.
 func (c *Client) GetJSON(ctx context.Context, path string, headers map[string]string) ([]byte, error) {
+	body, status, err := c.GetJSONStatus(ctx, path, headers)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		// Reconstruct a StatusError without the body — matches prior behavior.
+		return nil, &StatusError{
+			Operation:  "GetJSON",
+			Path:       path,
+			StatusCode: status,
+		}
+	}
+	return body, nil
+}
+
+// GetJSONStatus is like GetJSON but returns the body and HTTP status code for
+// every non-transport success, allowing callers to parse JSON error bodies on
+// 4xx responses. Network errors and retry-exhausted errors still return a
+// non-nil error (e.g. *StatusError for 5xx/429 after retries).
+//
+// On success the returned status is always the final HTTP status code (may be
+// 2xx or 4xx); callers decide how to interpret it.
+func (c *Client) GetJSONStatus(ctx context.Context, path string, headers map[string]string) ([]byte, int, error) {
 	url := "https://" + c.baseURL + path
 
 	resp, err := c.Get(ctx, url, headers)
 	if err != nil {
-		return nil, fmt.Errorf("httpclient: GetJSON %s: %w", path, err)
+		return nil, 0, fmt.Errorf("httpclient: GetJSON %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("httpclient: GetJSON %s: unexpected status %d", path, resp.StatusCode)
-	}
-
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("httpclient: GetJSON %s: read body: %w", path, err)
+		return nil, resp.StatusCode, fmt.Errorf("httpclient: GetJSON %s: read body: %w", path, err)
 	}
-
-	return data, nil
+	return data, resp.StatusCode, nil
 }
 
 // NewForTest creates a Client suitable for unit tests. baseURL should be the
@@ -259,3 +327,23 @@ func (c *Client) isDDoSGuard(resp *http.Response) bool {
 	return bytes.Contains(sniffed, []byte(ddosGuardMarker))
 }
 
+// StatusErrorFromResponse builds a StatusError from a non-OK response. It may
+// read a small prefix of the body to detect DDoS-Guard challenges.
+func StatusErrorFromResponse(operation, path string, resp *http.Response) error {
+	statusErr := &StatusError{
+		Operation:  operation,
+		Path:       path,
+		StatusCode: resp.StatusCode,
+		RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+	}
+	if resp.Body == nil {
+		return statusErr
+	}
+
+	limited := io.LimitReader(resp.Body, ddosGuardSniffLimit)
+	sniffed, err := io.ReadAll(limited)
+	if err == nil {
+		statusErr.DDoSGuard = bytes.Contains(sniffed, []byte(ddosGuardMarker))
+	}
+	return statusErr
+}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 
 	"go.uber.org/zap"
 
@@ -13,10 +14,13 @@ import (
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 	"github.com/ball2jh/annas-archive-mcp/internal/model"
 	"github.com/ball2jh/annas-archive-mcp/internal/scraper"
+	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
 // hashRE matches a valid 32-character hexadecimal MD5 hash.
 var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+var dateOnlyRE = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+var sourceIDRE = regexp.MustCompile(`^(lg|libgen|zlib)[a-z0-9_-]*\d*$`)
 
 // GetDetails fetches full metadata for an item by MD5 hash.
 //
@@ -29,7 +33,7 @@ var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 //  6. Attach stats to the result and return.
 func GetDetails(ctx context.Context, client *httpclient.Client, logger *zap.Logger, hash string) (*model.BookDetails, error) {
 	if !hashRE.MatchString(hash) {
-		return nil, fmt.Errorf("details: invalid hash %q: must be exactly 32 hex characters", hash)
+		return nil, usererror.New("INVALID_HASH", "hash must be a 32-character MD5 hex string.")
 	}
 
 	doc, err := client.GetHTML(ctx, "/md5/"+hash)
@@ -45,6 +49,7 @@ func GetDetails(ctx context.Context, client *httpclient.Client, logger *zap.Logg
 	if result.Hash == "" {
 		result.Hash = hash
 	}
+	result.Description = cleanDescription(result.Description)
 
 	stats, err := api.FetchStats(ctx, client, hash)
 	if err != nil {
@@ -59,4 +64,45 @@ func GetDetails(ctx context.Context, client *httpclient.Client, logger *zap.Logg
 	}
 
 	return result, nil
+}
+
+func cleanDescription(raw string) string {
+	lines := strings.Split(raw, "\n")
+	cleaned := make([]string, 0, len(lines))
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || looksLikeSourceMetadata(line) {
+			continue
+		}
+		cleaned = append(cleaned, line)
+	}
+
+	return strings.Join(cleaned, "\n")
+}
+
+func looksLikeSourceMetadata(line string) bool {
+	lower := strings.ToLower(line)
+	if dateOnlyRE.MatchString(lower) {
+		return true
+	}
+	if strings.HasPrefix(lower, "lgli/") ||
+		strings.HasPrefix(lower, "lgrsnf/") ||
+		strings.HasPrefix(lower, "zlib/") ||
+		strings.HasPrefix(lower, "libgen/") {
+		return true
+	}
+	if strings.Contains(lower, "/") && hasFileExtension(lower) {
+		return true
+	}
+	return sourceIDRE.MatchString(lower)
+}
+
+func hasFileExtension(line string) bool {
+	for _, ext := range []string{".epub", ".pdf", ".mobi", ".azw3", ".djvu", ".cbz", ".cbr"} {
+		if strings.Contains(line, ext) {
+			return true
+		}
+	}
+	return false
 }

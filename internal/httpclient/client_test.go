@@ -2,6 +2,7 @@ package httpclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -139,6 +140,82 @@ func TestRetryOn429(t *testing.T) {
 	want := int32(maxRetries + 1)
 	if calls.Load() != want {
 		t.Errorf("want %d calls, got %d", want, calls.Load())
+	}
+}
+
+// TestRetryAfterHonored verifies that a Retry-After header larger than the
+// (test-overridden) backoff causes the client to wait at least that long
+// before the next attempt.
+func TestRetryAfterHonored(t *testing.T) {
+	const (
+		retryAfterSecs = 1 // 1s is the smallest integer Retry-After
+		maxRetries     = 1
+	)
+	var calls atomic.Int32
+	var firstCallAt, secondCallAt time.Time
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			firstCallAt = time.Now()
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", retryAfterSecs))
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		secondCallAt = time.Now()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, maxRetries)
+	// Keep the configured backoff tiny so we can prove Retry-After dominated.
+	overrideBackoffForTest(t)
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/", nil)
+	resp, err := c.Do(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("want 200 on second call, got %d", resp.StatusCode)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("want 2 calls, got %d", calls.Load())
+	}
+	gap := secondCallAt.Sub(firstCallAt)
+	// Allow 50ms slack for scheduler jitter — the wait should be ~1s.
+	want := time.Duration(retryAfterSecs)*time.Second - 50*time.Millisecond
+	if gap < want {
+		t.Errorf("client did not honor Retry-After: gap %v < %v", gap, want)
+	}
+}
+
+// TestRetryAfterSetOnStatusError verifies the parsed Retry-After is carried
+// on the StatusError. Uses maxRetries=0 so the single 429 attempt yields the
+// error directly, without actually waiting the Retry-After duration.
+func TestRetryAfterSetOnStatusError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "42")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv, 0) // single attempt, no retry wait
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/", nil)
+	_, err := c.Do(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var se *StatusError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected *StatusError in chain, got %T: %v", err, err)
+	}
+	if se.RetryAfter != 42*time.Second {
+		t.Errorf("StatusError.RetryAfter = %v, want 42s", se.RetryAfter)
 	}
 }
 

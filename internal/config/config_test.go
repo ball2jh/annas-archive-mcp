@@ -17,6 +17,15 @@ func TestDefaults(t *testing.T) {
 	if cfg.BaseURL != "annas-archive.gl" {
 		t.Errorf("BaseURL = %q, want %q", cfg.BaseURL, "annas-archive.gl")
 	}
+	if cfg.ScinetBaseURL != "sci-net.xyz" {
+		t.Errorf("ScinetBaseURL = %q, want %q", cfg.ScinetBaseURL, "sci-net.xyz")
+	}
+	if cfg.LibgenBaseURL != "libgen.li" {
+		t.Errorf("LibgenBaseURL = %q, want %q", cfg.LibgenBaseURL, "libgen.li")
+	}
+	if !cfg.LibgenEnabled {
+		t.Error("LibgenEnabled = false, want true")
+	}
 	if cfg.HTTPTimeout != 30*time.Second {
 		t.Errorf("HTTPTimeout = %v, want 30s", cfg.HTTPTimeout)
 	}
@@ -28,6 +37,9 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.MaxConcurrency != 10 {
 		t.Errorf("MaxConcurrency = %d, want 10", cfg.MaxConcurrency)
+	}
+	if cfg.ToolRateLimitPerMinute != 60 {
+		t.Errorf("ToolRateLimitPerMinute = %d, want 60", cfg.ToolRateLimitPerMinute)
 	}
 	if cfg.LogLevel != "warn" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "warn")
@@ -53,10 +65,14 @@ func TestCustomValues(t *testing.T) {
 	t.Setenv("ANNAS_SECRET_KEY", "mysecret")
 	t.Setenv("ANNAS_DOWNLOAD_PATH", "/tmp/books")
 	t.Setenv("ANNAS_BASE_URL", "mirror.example.com")
+	t.Setenv("SCINET_BASE_URL", "scinet.example.com")
+	t.Setenv("LIBGEN_BASE_URL", "libgen.example.com")
+	t.Setenv("LIBGEN_ENABLED", "false")
 	t.Setenv("ANNAS_HTTP_TIMEOUT", "60s")
 	t.Setenv("ANNAS_STATS_TIMEOUT", "10s")
 	t.Setenv("ANNAS_MAX_RETRIES", "5")
 	t.Setenv("ANNAS_MAX_CONCURRENCY", "20")
+	t.Setenv("ANNAS_TOOL_RATE_LIMIT_PER_MINUTE", "120")
 	t.Setenv("ANNAS_LOG_LEVEL", "debug")
 
 	cfg, err := config.Load()
@@ -73,6 +89,15 @@ func TestCustomValues(t *testing.T) {
 	if cfg.BaseURL != "mirror.example.com" {
 		t.Errorf("BaseURL = %q, want %q", cfg.BaseURL, "mirror.example.com")
 	}
+	if cfg.ScinetBaseURL != "scinet.example.com" {
+		t.Errorf("ScinetBaseURL = %q, want %q", cfg.ScinetBaseURL, "scinet.example.com")
+	}
+	if cfg.LibgenBaseURL != "libgen.example.com" {
+		t.Errorf("LibgenBaseURL = %q, want %q", cfg.LibgenBaseURL, "libgen.example.com")
+	}
+	if cfg.LibgenEnabled {
+		t.Error("LibgenEnabled = true, want false")
+	}
 	if cfg.HTTPTimeout != 60*time.Second {
 		t.Errorf("HTTPTimeout = %v, want 60s", cfg.HTTPTimeout)
 	}
@@ -84,6 +109,9 @@ func TestCustomValues(t *testing.T) {
 	}
 	if cfg.MaxConcurrency != 20 {
 		t.Errorf("MaxConcurrency = %d, want 20", cfg.MaxConcurrency)
+	}
+	if cfg.ToolRateLimitPerMinute != 120 {
+		t.Errorf("ToolRateLimitPerMinute = %d, want 120", cfg.ToolRateLimitPerMinute)
 	}
 	if cfg.LogLevel != "debug" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "debug")
@@ -186,6 +214,41 @@ func TestNegativeMaxConcurrency(t *testing.T) {
 	_, err := config.Load()
 	if err == nil {
 		t.Error("Load() expected error for negative ANNAS_MAX_CONCURRENCY, got nil")
+	}
+}
+
+func TestInvalidToolRateLimit(t *testing.T) {
+	t.Setenv("ANNAS_TOOL_RATE_LIMIT_PER_MINUTE", "notanumber")
+	_, err := config.Load()
+	if err == nil {
+		t.Error("Load() expected error for non-integer ANNAS_TOOL_RATE_LIMIT_PER_MINUTE, got nil")
+	}
+}
+
+func TestNegativeToolRateLimit(t *testing.T) {
+	t.Setenv("ANNAS_TOOL_RATE_LIMIT_PER_MINUTE", "-1")
+	_, err := config.Load()
+	if err == nil {
+		t.Error("Load() expected error for negative ANNAS_TOOL_RATE_LIMIT_PER_MINUTE, got nil")
+	}
+}
+
+func TestZeroToolRateLimitDisablesLimiter(t *testing.T) {
+	t.Setenv("ANNAS_TOOL_RATE_LIMIT_PER_MINUTE", "0")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if cfg.ToolRateLimitPerMinute != 0 {
+		t.Errorf("ToolRateLimitPerMinute = %d, want 0", cfg.ToolRateLimitPerMinute)
+	}
+}
+
+func TestInvalidLibgenEnabled(t *testing.T) {
+	t.Setenv("LIBGEN_ENABLED", "sometimes")
+	_, err := config.Load()
+	if err == nil {
+		t.Error("Load() expected error for invalid LIBGEN_ENABLED, got nil")
 	}
 }
 
