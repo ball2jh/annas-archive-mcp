@@ -67,10 +67,11 @@ Returns title, authors, publisher, year, ISBN, DOI, ISSN, language, format, size
 
 Tool execution errors are returned as MCP tool errors with stable codes, so agents can self-correct:
 
-- `[INVALID_QUERY]`, `[INVALID_CONTENT_TYPE]`, `[INVALID_HASH]`, `[INVALID_DOI]`
-- `[AUTH_REQUIRED]`, `[AUTH_INVALID]`, `[PATH_REQUIRED]`, `[PATH_UNAVAILABLE]`
-- `[RATE_LIMITED]`, `[LOCAL_RATE_LIMITED]`, `[QUOTA_EXHAUSTED]`
-- `[UPSTREAM_BLOCKED]`, `[UPSTREAM_REJECTED]`, `[UPSTREAM_UNAVAILABLE]`, `[NOT_FOUND]`
+- Validation: `[INVALID_QUERY]`, `[INVALID_CONTENT_TYPE]`, `[INVALID_HASH]`, `[INVALID_DOI]`
+- Config / filesystem: `[CONFIG]`, `[AUTH_REQUIRED]`, `[AUTH_INVALID]`, `[PATH_REQUIRED]`, `[PATH_UNAVAILABLE]`, `[IO_ERROR]`
+- Rate / quota: `[RATE_LIMITED]`, `[LOCAL_RATE_LIMITED]`, `[QUOTA_EXHAUSTED]`
+- Transport: `[REQUEST_TIMEOUT]`, `[REQUEST_CANCELLED]`
+- Upstream: `[UPSTREAM_BLOCKED]`, `[UPSTREAM_REJECTED]`, `[UPSTREAM_UNAVAILABLE]`, `[UPSTREAM_API_ERROR]`, `[NOT_FOUND]`, `[NOT_FOUND_ON_LIBGEN]`, `[NOT_FOUND_ON_SCINET]`, `[NOT_FAST_DOWNLOADABLE]`
 
 Internal URLs, secret keys, and raw upstream error details are logged for debugging but not returned to the caller.
 
@@ -157,6 +158,7 @@ internal/
   libgen/       Libgen fallback downloads by MD5
   scinet/       Sci-Net fallback downloads by DOI
   model/        Shared data types
+  usererror/    User-facing error type with stable codes
   search/       Search orchestration + parallel stats enrichment
   download/     Download orchestration + atomic file writes
   doi/          DOI resolution via /scidb
