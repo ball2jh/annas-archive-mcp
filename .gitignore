@@ -6,6 +6,10 @@ downloads/
 # MCP server config — may contain ANNAS_SECRET_KEY or other credentials
 .mcp.json
 .mcp.local.json
+.codex
+
+# Local planning notes
+docs/
 
 # Editor/IDE
 .idea/
