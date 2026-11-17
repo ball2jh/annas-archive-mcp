@@ -384,3 +384,30 @@ func TestBrowserSettings(t *testing.T) {
 		t.Error("Load() expected error for an unknown ANNAS_BROWSER value, got nil")
 	}
 }
+
+func TestLoadSlowDownload(t *testing.T) {
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if cfg.SlowDownloadEnabled {
+		t.Error("SlowDownloadEnabled = true by default, want false")
+	}
+
+	t.Setenv("ANNAS_SLOW_DOWNLOAD", "on")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if !cfg.SlowDownloadEnabled {
+		t.Error("SlowDownloadEnabled = false with ANNAS_SLOW_DOWNLOAD=on")
+	}
+	if cfg.SlowLink != nil {
+		t.Error("SlowLink is set by Load; it must be installed by main")
+	}
+
+	t.Setenv("ANNAS_SLOW_DOWNLOAD", "maybe")
+	if _, err := config.Load(); err == nil {
+		t.Error("Load() expected error for an unknown ANNAS_SLOW_DOWNLOAD value, got nil")
+	}
+}

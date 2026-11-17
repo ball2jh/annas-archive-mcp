@@ -768,9 +768,10 @@ func TestBothFailedPicksTheActionableError(t *testing.T) {
 		wantSame  error
 		wantText  string
 	}{
-		{"lapsed membership", usererror.New(usererror.CodeAuthInvalid, "No membership."), libgenMissing, usererror.CodeAuthInvalid, nil, "Libgen"},
-		{"lapsed membership, libgen rejected", usererror.New(usererror.CodeAuthInvalid, "No membership."), libgenRejected, usererror.CodeAuthInvalid, nil, "Libgen"},
-		{"quota", usererror.New(usererror.CodeQuotaExhausted, "Quota reached."), libgenMissing, usererror.CodeQuotaExhausted, nil, "Libgen"},
+		{"lapsed membership", usererror.New(usererror.CodeAuthInvalid, "No membership."), libgenMissing, usererror.CodeAuthInvalid, nil, "Libgen has no copy of hash x."},
+		{"lapsed membership, libgen rejected", usererror.New(usererror.CodeAuthInvalid, "No membership."), libgenRejected, usererror.CodeAuthInvalid, nil, "Libgen returned HTTP 403"},
+		{"lapsed membership, libgen unclassified", usererror.New(usererror.CodeAuthInvalid, "No membership."), context.DeadlineExceeded, usererror.CodeAuthInvalid, nil, "Libgen fallback failed as well"},
+		{"quota", usererror.New(usererror.CodeQuotaExhausted, "Quota reached."), libgenMissing, usererror.CodeQuotaExhausted, nil, "Libgen has no copy of hash x."},
 		{"in neither source", usererror.New(usererror.CodeNotFastDownloadable, "Download it manually at URL."), libgenMissing, usererror.CodeNotFastDownloadable, nil, "manually"},
 		{"no key", usererror.New(usererror.CodeAuthRequired, "No key."), libgenMissing, usererror.CodeNotFoundOnLibgen, nil, "ANNAS_SECRET_KEY"},
 		{"anna transient, libgen missing", rateLimited, libgenMissing, "", rateLimited, ""},
@@ -817,6 +818,111 @@ func TestDownloadRejectsHTMLFromFastDownload(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{SecretKey: "mysecret", DownloadPath: dir, LibgenEnabled: false}
 	_, err := Download(context.Background(), newDownloadTestClient(t, srv), zaptest.NewLogger(t), cfg, hash, "Thang", "pdf")
+	if !usererror.HasCode(err, usererror.CodeUpstreamRejected) {
+		t.Fatalf("error = %v, want %s", err, usererror.CodeUpstreamRejected)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("download dir has %d entries, want none", len(entries))
+	}
+}
+
+// slowServer serves a file at /file and refuses everything else, so only the
+// slow-download tier can deliver.
+func slowServer(t *testing.T, contentType, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/file" {
+			w.Header().Set("Content-Type", contentType)
+			_, _ = io.WriteString(w, body)
+			return
+		}
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestDownloadFallsBackToSlowDownload(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef"
+	srv := slowServer(t, "application/octet-stream", "%PDF-1.7 slow body")
+
+	var asked string
+	cfg := &config.Config{
+		DownloadPath:  t.TempDir(),
+		LibgenBaseURL: srv.Listener.Addr().String(),
+		LibgenEnabled: true,
+		SlowLink: func(_ context.Context, h string) (string, error) {
+			asked = h
+			return srv.URL + "/file", nil
+		},
+	}
+
+	result, err := Download(context.Background(), newDownloadTestClient(t, srv), zaptest.NewLogger(t), cfg, hash, "Thang", "pdf")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Source != SourceSlowDownload {
+		t.Errorf("Source = %q, want %q", result.Source, SourceSlowDownload)
+	}
+	if asked != hash {
+		t.Errorf("SlowLink was asked for %q, want %q", asked, hash)
+	}
+	if got, _ := os.ReadFile(result.FilePath); string(got) != "%PDF-1.7 slow body" {
+		t.Errorf("file body = %q", got)
+	}
+	if len(slowSlot) != 0 {
+		t.Error("the slow-download slot was not released")
+	}
+}
+
+// What the slow tier says to do (here: complete the manual check) is the
+// error to report, and a failed attempt must free the slot.
+func TestDownloadReportsSlowDownloadInstruction(t *testing.T) {
+	srv := slowServer(t, "application/octet-stream", "unused")
+	needsPerson := usererror.New(usererror.CodeUpstreamBlocked, "Complete the manual check.")
+	cfg := &config.Config{
+		DownloadPath:  t.TempDir(),
+		LibgenBaseURL: srv.Listener.Addr().String(),
+		LibgenEnabled: true,
+		SlowLink:      func(context.Context, string) (string, error) { return "", needsPerson },
+	}
+
+	_, err := Download(context.Background(), newDownloadTestClient(t, srv), zaptest.NewLogger(t), cfg, "0123456789abcdef0123456789abcdef", "Thang", "pdf")
+	if !usererror.HasCode(err, usererror.CodeUpstreamBlocked) || !strings.Contains(err.Error(), "manual check") {
+		t.Fatalf("error = %v, want the slow-download instruction", err)
+	}
+	if len(slowSlot) != 0 {
+		t.Error("the slow-download slot was not released")
+	}
+}
+
+// A slow-download failure with nothing actionable to say leaves the earlier
+// tiers' error in place.
+func TestDownloadKeepsEarlierErrorWhenSlowDownloadFailsVaguely(t *testing.T) {
+	srv := slowServer(t, "application/octet-stream", "unused")
+	cfg := &config.Config{
+		DownloadPath:  t.TempDir(),
+		LibgenBaseURL: srv.Listener.Addr().String(),
+		LibgenEnabled: true,
+		SlowLink:      func(context.Context, string) (string, error) { return "", errors.New("chrome crashed") },
+	}
+
+	_, err := Download(context.Background(), newDownloadTestClient(t, srv), zaptest.NewLogger(t), cfg, "0123456789abcdef0123456789abcdef", "Thang", "pdf")
+	if !usererror.HasCode(err, usererror.CodeNotFoundOnLibgen) {
+		t.Fatalf("error = %v, want %s", err, usererror.CodeNotFoundOnLibgen)
+	}
+}
+
+// A web page from the partner server must not be saved as the file.
+func TestDownloadRejectsHTMLFromSlowDownload(t *testing.T) {
+	srv := slowServer(t, "text/html", "<html>Too many downloads</html>")
+	dir := t.TempDir()
+	cfg := &config.Config{
+		DownloadPath: dir,
+		SlowLink:     func(context.Context, string) (string, error) { return srv.URL + "/file", nil },
+	}
+
+	_, err := Download(context.Background(), newDownloadTestClient(t, srv), zaptest.NewLogger(t), cfg, "0123456789abcdef0123456789abcdef", "Thang", "pdf")
 	if !usererror.HasCode(err, usererror.CodeUpstreamRejected) {
 		t.Fatalf("error = %v, want %s", err, usererror.CodeUpstreamRejected)
 	}

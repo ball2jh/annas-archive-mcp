@@ -158,3 +158,30 @@ func TestCancelledContextIsNotRetried(t *testing.T) {
 		t.Errorf("server saw %d request(s), want 1", n)
 	}
 }
+
+// A host that keeps stalling must not consume the whole retry budget: each
+// stalled attempt costs the full timeout.
+func TestRepeatedStallsStopRetrying(t *testing.T) {
+	var calls atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	c := New(&config.Config{BaseURL: srv.Listener.Addr().String(), HTTPTimeout: 100 * time.Millisecond, MaxRetries: 5}, zaptest.NewLogger(t))
+	c.http.Transport = srv.Client().Transport
+
+	_, err := c.Get(context.Background(), srv.URL, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want one wrapping context.DeadlineExceeded", err)
+	}
+	if n := calls.Load(); n != maxStalledAttempts {
+		t.Errorf("made %d attempt(s), want %d", n, maxStalledAttempts)
+	}
+}

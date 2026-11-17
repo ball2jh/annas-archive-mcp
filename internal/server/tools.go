@@ -78,7 +78,7 @@ type SearchOutput struct {
 type DownloadOutput struct {
 	FilePath       string `json:"file_path"`
 	Message        string `json:"message"`
-	Source         string `json:"source,omitempty"` // "fast_download" | "libgen.li" | "sci-net" | "cache"
+	Source         string `json:"source,omitempty"` // "fast_download" | "libgen.li" | "slow_download" | "sci-net" | "cache"
 	AlreadyExisted bool   `json:"already_existed,omitempty"`
 }
 

@@ -16,7 +16,7 @@ Search across all Anna's Archive content types. Returns human-readable text and 
 Returns title, authors, format, size, language, MD5 hash, and community stats (downloads, lists, reports).
 
 ### `download`
-Download a file by MD5 hash. Requires `ANNAS_DOWNLOAD_PATH`. Uses Anna's fast_download API when `ANNAS_SECRET_KEY` is configured, then falls back to Libgen when enabled. Saves only inside the configured download directory.
+Download a file by MD5 hash. Requires `ANNAS_DOWNLOAD_PATH`. Uses Anna's fast_download API when `ANNAS_SECRET_KEY` is configured, then falls back to Libgen when enabled, and finally to Anna's Archive's slow-download servers when `ANNAS_SLOW_DOWNLOAD=on`. Saves only inside the configured download directory.
 
 The saved file is named `<title>.<format>`. If a non-empty file with that name already exists, the call returns it without making any request (and without using quota) — so pick a different title to download a different edition of the same book.
 
@@ -38,7 +38,7 @@ Resolve a DOI to paper metadata and a downloadable hash.
 Returns title, authors, journal, year, DOI, and MD5 hash.
 
 ### `download_by_doi`
-Download a paper by DOI. Requires `ANNAS_DOWNLOAD_PATH`. Resolves the DOI to an MD5 on Anna's Archive and downloads it the same way as `download` (fast_download, then Libgen); if that fails, falls back to Sci-Net. `ANNAS_SECRET_KEY` is not required for the Libgen and Sci-Net paths.
+Download a paper by DOI. Requires `ANNAS_DOWNLOAD_PATH`. Resolves the DOI to an MD5 on Anna's Archive and downloads it the same way as `download` (fast_download, then Libgen, then slow download when enabled); if that fails, falls back to Sci-Net. `ANNAS_SECRET_KEY` is not required for the Libgen and Sci-Net paths.
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
@@ -146,11 +146,12 @@ All via environment variables:
 | `LIBGEN_ENABLED` | No | `true` | Enables Libgen fallback for `download` |
 | `ANNAS_HTTP_TIMEOUT` | No | `30s` | How long a request may stall (no response, or no new data) before it is abandoned. Not a limit on total download time. |
 | `ANNAS_STATS_TIMEOUT` | No | `5s` | Time allowed for community stats; results are returned without stats when it elapses |
-| `ANNAS_MAX_RETRIES` | No | `3` | Retry attempts on network errors, 429 and 5xx |
+| `ANNAS_MAX_RETRIES` | No | `3` | Retry attempts on network errors, 429 and 5xx. A request that hits `ANNAS_HTTP_TIMEOUT` is retried once at most. |
 | `ANNAS_MAX_CONCURRENCY` | No | `10` | Parallel community-stats request cap per tool call (requests to Anna's Archive are further limited to four in flight overall) |
 | `ANNAS_TOOL_RATE_LIMIT_PER_MINUTE` | No | `60` | Per-tool local call cap. Set `0` to disable. |
 | `ANNAS_LOG_LEVEL` | No | `warn` | Log level (`debug`, `info`, `warn`, `error`) |
 | `ANNAS_BROWSER` | No | `auto` | `auto` opens Chrome when needed to pass the browser check; `off` never does |
+| `ANNAS_SLOW_DOWNLOAD` | No | `off` | `on` adds Anna's Archive's free slow-download servers as the last download source. Needs the browser; see below. |
 | `ANNAS_CHROME_PATH` | No | found on `PATH` | Chrome or Chromium binary to use for the browser check |
 | `ANNAS_SESSION_FILE` | No | `<user config dir>/annas-archive-mcp/session.json` | Where the browser session is saved. The Chrome profile lives beside it. |
 
@@ -170,6 +171,18 @@ Requirements and limits:
 - Linux and macOS only for now. On Windows, and on machines without a display, the affected tools return `[UPSTREAM_BLOCKED]`.
 - The session file holds live cookies for the site. Treat it like a credential.
 - Set `ANNAS_BROWSER=off` to never open a window. The JSON endpoints (community stats, fast_download) are not behind the check, so `download` by hash keeps working either way.
+
+## Slow downloads
+
+With `ANNAS_SLOW_DOWNLOAD=on`, a file that neither fast_download nor Libgen can deliver is fetched from one of Anna's Archive's free slow-download servers. It is off by default because it is slower and needs more from the machine:
+
+- Every slow download opens the Chrome window. A slow-download page runs the browser check afresh on each visit, so the saved session cannot stand in for the browser. The server reads the partner-server link from the page, closes Chrome, and downloads the file itself.
+- Anna's Archive may ask for a manual check (a captcha) in that window. The server does not solve it: the tool returns `[UPSTREAM_BLOCKED]` asking for a person to complete it. Retry and complete the check in the window; the Chrome profile is then let through unattended for a while.
+- The partner servers allow one download at a time per IP address without a membership, so slow downloads run one after another. If something else on your network is already downloading from one, the tool returns `[RATE_LIMITED]`.
+- A server without a waitlist is preferred. If only waitlisted ones are listed, the page counts down before showing its link; a lookup is given up to three minutes.
+- It needs `ANNAS_BROWSER` left on and has the same requirements as the browser check: Chrome or Chromium, a desktop session, Linux or macOS.
+
+Downloads from this source report `"source": "slow_download"`.
 
 ## Operational notes
 

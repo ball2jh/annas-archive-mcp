@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -81,31 +82,22 @@ type Solver struct {
 	// and kept between runs.
 	ProfileDir string
 	Logger     *zap.Logger
+
+	// mu keeps Chrome runs apart: one profile cannot serve two at once.
+	mu sync.Mutex
 }
 
 // Solve opens a guarded page of host in Chrome, waits for the check to pass,
 // and returns the cookies for host together with Chrome's User-Agent.
 func (s *Solver) Solve(ctx context.Context, host string) (*session.State, error) {
-	chrome, err := FindChrome(s.ChromePath)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(s.ProfileDir, 0o700); err != nil {
-		return nil, fmt.Errorf("browser: create profile directory: %w", err)
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(ctx, solveTimeout)
 	defer cancel()
 
-	s.Logger.Info("browser: opening Chrome to pass the DDoS-Guard check", zap.String("chrome", chrome))
-	conn, err := launch(ctx, chrome, []string{
-		"--remote-debugging-pipe",
-		"--user-data-dir=" + s.ProfileDir,
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--window-size=900,700",
-		"about:blank",
-	})
+	s.Logger.Info("browser: opening Chrome to pass the DDoS-Guard check")
+	conn, err := s.open(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -119,15 +111,42 @@ func (s *Solver) Solve(ctx context.Context, host string) (*session.State, error)
 	return state, nil
 }
 
+// open starts Chrome on the solver's profile. The caller closes the
+// connection, which also closes Chrome.
+func (s *Solver) open(ctx context.Context) (*cdpConn, error) {
+	chrome, err := FindChrome(s.ChromePath)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(s.ProfileDir, 0o700); err != nil {
+		return nil, fmt.Errorf("browser: create profile directory: %w", err)
+	}
+	return launch(ctx, chrome, []string{
+		"--remote-debugging-pipe",
+		"--user-data-dir=" + s.ProfileDir,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--window-size=900,700",
+		"about:blank",
+	})
+}
+
 // pageStatus is what the polling script reports about the open tab.
 type pageStatus struct {
 	Host      string `json:"host"`
 	Title     string `json:"title"`
 	Ready     string `json:"ready"`
 	UserAgent string `json:"ua"`
+	// Manual is set when the check has given up on passing by itself and is
+	// asking a person to complete a captcha.
+	Manual bool `json:"manual"`
 }
 
-const statusScript = `JSON.stringify({host: location.hostname, title: document.title, ready: document.readyState, ua: navigator.userAgent})`
+const statusScript = `JSON.stringify({host: location.hostname, title: document.title, ready: document.readyState, ua: navigator.userAgent, manual: ` + manualCheckJS + `})`
+
+// manualCheckJS is a JavaScript expression that is true while the page shows
+// DDoS-Guard's manual check.
+const manualCheckJS = `/manual check|too much like a bot/i.test(document.body ? document.body.innerText : '')`
 
 // passed reports whether the tab shows the real site rather than the check.
 func (p pageStatus) passed(host string) bool {
@@ -137,20 +156,12 @@ func (p pageStatus) passed(host string) bool {
 
 // solve drives an already-running browser through the check.
 func solve(ctx context.Context, conn *cdpConn, host string) (*session.State, error) {
-	var target struct {
-		TargetID string `json:"targetId"`
-	}
-	if err := conn.call(ctx, "", "Target.createTarget", map[string]any{"url": "https://" + host + challengePath}, &target); err != nil {
-		return nil, fmt.Errorf("browser: open page: %w", err)
-	}
-	var attached struct {
-		SessionID string `json:"sessionId"`
-	}
-	if err := conn.call(ctx, "", "Target.attachToTarget", map[string]any{"targetId": target.TargetID, "flatten": true}, &attached); err != nil {
-		return nil, fmt.Errorf("browser: attach to page: %w", err)
+	sessionID, err := openTab(ctx, conn, "https://"+host+challengePath)
+	if err != nil {
+		return nil, err
 	}
 
-	status, err := waitForPass(ctx, conn, attached.SessionID, host)
+	status, err := waitForPass(ctx, conn, sessionID, host)
 	if err != nil {
 		return nil, err
 	}
@@ -183,23 +194,23 @@ func waitForPass(ctx context.Context, conn *cdpConn, sessionID, host string) (pa
 	for {
 		select {
 		case <-ctx.Done():
+			if last.Manual {
+				return last, fmt.Errorf("%w: %w", ErrNeedsPerson, ctx.Err())
+			}
 			return last, fmt.Errorf("browser: the DDoS-Guard check did not pass in time (page title %q): %w", last.Title, ctx.Err())
 		case <-ticker.C:
 		}
 
-		var eval struct {
-			Result struct {
-				Value string `json:"value"`
-			} `json:"result"`
-		}
-		err := conn.call(ctx, sessionID, "Runtime.evaluate", map[string]any{"expression": statusScript, "returnByValue": true}, &eval)
+		raw, err := evalString(ctx, conn, sessionID, statusScript)
 		if err != nil {
-			if errors.Is(err, errBrowserClosed) || ctx.Err() != nil {
+			if errors.Is(err, errBrowserClosed) {
 				return last, fmt.Errorf("browser: %w", err)
 			}
-			continue // the page is mid-navigation; ask again
+			// The page is mid-navigation, or time ran out mid-call: ask
+			// again, and let the deadline case above report the latter.
+			continue
 		}
-		if json.Unmarshal([]byte(eval.Result.Value), &last) == nil && last.passed(host) {
+		if json.Unmarshal([]byte(raw), &last) == nil && last.passed(host) {
 			return last, nil
 		}
 	}

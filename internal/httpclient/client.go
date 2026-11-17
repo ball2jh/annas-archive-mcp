@@ -53,6 +53,13 @@ const (
 	// tool call reports "retry after 10m" instead of hanging for ten minutes.
 	maxRetryAfterWait = 30 * time.Second
 
+	// maxStalledAttempts is how many times one request may hit the stall
+	// timeout before the client gives up, whatever the retry budget. A stall
+	// costs the whole timeout and a host that stalled twice running is rarely
+	// about to answer, so spending every retry on it turns one dead link into
+	// minutes of waiting.
+	maxStalledAttempts = 2
+
 	// baseBackoff is the initial wait duration between retries.
 	baseBackoff = 1 * time.Second
 
@@ -191,6 +198,7 @@ func (c *Client) BaseURL() string {
 //
 // Retry policy:
 //   - 5xx responses and network/timeout errors → retriable
+//   - stall timeouts → retried once only (see maxStalledAttempts)
 //   - 429 (Too Many Requests) → retriable
 //   - 403 → sniff body for DDoS-Guard; NOT retriable in either case
 //   - other 4xx → NOT retriable
@@ -203,6 +211,7 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 		lastRetryAfter time.Duration
 		attempts       = c.maxRetries + 1 // first attempt + retries
 		recovered      bool               // challenge recovery is tried once per request
+		stalled        int                // attempts that ended in the stall timeout
 	)
 
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -238,6 +247,11 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 			if ctx.Err() != nil {
 				// The caller gave up; retrying cannot succeed.
 				return nil, fmt.Errorf("httpclient: %w", err)
+			}
+			if errors.Is(err, errStalled) {
+				if stalled++; stalled >= maxStalledAttempts {
+					return nil, fmt.Errorf("httpclient: gave up after %d stalled attempt(s): %w", stalled, err)
+				}
 			}
 			lastErr = err
 			lastRetryAfter = 0 // no header to honor on a network failure

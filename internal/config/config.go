@@ -2,6 +2,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -79,6 +80,17 @@ type Config struct {
 	// Default true. Set ANNAS_BROWSER=off to disable.
 	BrowserEnabled bool
 
+	// SlowDownloadEnabled adds Anna's Archive's free slow-download servers as
+	// the last download source. Default false: each use opens a Chrome
+	// window, and the site may ask a person to complete a captcha in it.
+	// Set ANNAS_SLOW_DOWNLOAD=on to enable.
+	SlowDownloadEnabled bool
+
+	// SlowLink obtains a slow-download link for a file hash. It is not read
+	// from the environment: main installs it when SlowDownloadEnabled is set
+	// and a browser is available. Nil leaves the source unused.
+	SlowLink func(ctx context.Context, hash string) (string, error)
+
 	// ChromePath overrides Chrome/Chromium discovery. May be empty.
 	ChromePath string
 
@@ -118,6 +130,14 @@ func Load() (*Config, error) {
 		cfg.BrowserEnabled = false
 	default:
 		return nil, fmt.Errorf("config: invalid ANNAS_BROWSER %q: must be auto or off", v)
+	}
+
+	switch v := strings.ToLower(strings.TrimSpace(os.Getenv("ANNAS_SLOW_DOWNLOAD"))); v {
+	case "", "off", "false", "0":
+	case "on", "true", "1":
+		cfg.SlowDownloadEnabled = true
+	default:
+		return nil, fmt.Errorf("config: invalid ANNAS_SLOW_DOWNLOAD %q: must be on or off", v)
 	}
 
 	cfg.SessionFile = strings.TrimSpace(os.Getenv("ANNAS_SESSION_FILE"))

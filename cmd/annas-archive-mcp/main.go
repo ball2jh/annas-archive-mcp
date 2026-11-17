@@ -21,6 +21,7 @@ import (
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 	"github.com/ball2jh/annas-archive-mcp/internal/server"
 	"github.com/ball2jh/annas-archive-mcp/internal/session"
+	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -98,6 +99,11 @@ func enableBrowserSession(cfg *config.Config, client *httpclient.Client, logger 
 			Logger:     logger,
 		}
 		solve = solver.Solve
+		if cfg.SlowDownloadEnabled {
+			cfg.SlowLink = slowLinker(solver, cfg.BaseURL)
+		}
+	} else if cfg.SlowDownloadEnabled {
+		logger.Warn("ANNAS_SLOW_DOWNLOAD is on but ANNAS_BROWSER is off — slow downloads need the browser and stay disabled")
 	}
 	store := session.NewStore(cfg.SessionFile, cfg.BaseURL, solve, logger)
 
@@ -114,6 +120,26 @@ func enableBrowserSession(cfg *config.Config, client *httpclient.Client, logger 
 		}
 		return apply(state), nil
 	})
+}
+
+// slowLinker adapts the browser to the download package, turning the failures
+// a caller can act on into user-facing errors.
+func slowLinker(solver *browser.Solver, host string) func(context.Context, string) (string, error) {
+	return func(ctx context.Context, hash string) (string, error) {
+		link, err := solver.SlowLink(ctx, host, hash)
+		switch {
+		case errors.Is(err, browser.ErrNeedsPerson):
+			return "", usererror.Wrap(usererror.CodeUpstreamBlocked,
+				"Anna's Archive asked for a manual check (a captcha) before the slow download and nobody completed it. A Chrome window opens for this: retry, complete the check in that window, and later downloads go through unattended for a while.", err)
+		case errors.Is(err, browser.ErrNoSlowServer):
+			return "", usererror.Wrap(usererror.CodeNotFound,
+				"Anna's Archive lists no slow-download server for this file.", err)
+		case errors.Is(err, browser.ErrNoChrome):
+			return "", usererror.Wrap(usererror.CodeUpstreamBlocked,
+				"Slow downloads need Google Chrome or Chromium on a machine with a desktop session (set ANNAS_CHROME_PATH if it is not found).", err)
+		}
+		return link, err
+	}
 }
 
 // buildVersion returns the release version, falling back to the module

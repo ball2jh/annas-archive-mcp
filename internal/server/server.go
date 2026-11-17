@@ -34,7 +34,7 @@ func New(cfg *config.Config, client *httpclient.Client, logger *zap.Logger, vers
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        toolDownload,
 		Title:       "Download Anna's Archive File",
-		Description: "Download a file by MD5 hash into the configured download directory. Uses Anna's Archive fast_download when a membership key is configured, then falls back to Libgen. Skips the download when a file with the same title and format already exists. Returns the saved file path and which source delivered it.",
+		Description: "Download a file by MD5 hash into the configured download directory. Uses Anna's Archive fast_download when a membership key is configured, then falls back to Libgen and, when enabled, Anna's Archive's slow-download servers. Skips the download when a file with the same title and format already exists. Returns the saved file path and which source delivered it.",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    false,
 			DestructiveHint: boolPtr(false),
@@ -66,7 +66,7 @@ func New(cfg *config.Config, client *httpclient.Client, logger *zap.Logger, vers
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        toolDownloadByDOI,
 		Title:       "Download Paper by DOI",
-		Description: "Download a paper by DOI into the configured download directory. Resolves the DOI on Anna's Archive and downloads it (fast_download, then Libgen), falling back to Sci-Net when that fails. Skips the download when a file with the same title and format already exists. Returns the saved file path and which source delivered it.",
+		Description: "Download a paper by DOI into the configured download directory. Resolves the DOI on Anna's Archive and downloads it (fast_download, then Libgen, then slow download when enabled), falling back to Sci-Net when that fails. Skips the download when a file with the same title and format already exists. Returns the saved file path and which source delivered it.",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    false,
 			DestructiveHint: boolPtr(false),

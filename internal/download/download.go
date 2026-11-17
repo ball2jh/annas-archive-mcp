@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"go.uber.org/zap"
 
@@ -26,6 +27,7 @@ import (
 const (
 	SourceFastDownload = "fast_download"
 	SourceLibgen       = "libgen.li"
+	SourceSlowDownload = "slow_download"
 	SourceSciNet       = "sci-net"
 	SourceCache        = "cache"
 )
@@ -144,8 +146,8 @@ func byDOIViaAnna(
 	return fetchByHash(ctx, client, logger, cfg, hash, dst)
 }
 
-// fetchByHash runs the fast_download → Libgen tiers for an already-validated
-// hash and saves the result to dst.
+// fetchByHash runs the fast_download → Libgen → slow-download tiers for an
+// already-validated hash and saves the result to dst.
 func fetchByHash(
 	ctx context.Context,
 	client *httpclient.Client,
@@ -168,21 +170,105 @@ func fetchByHash(
 	} else {
 		logger.Info("download: ANNAS_SECRET_KEY unset — skipping fast_download")
 		annaErr = usererror.New(usererror.CodeAuthRequired,
-			"ANNAS_SECRET_KEY is not set, so Anna's Archive fast_download was skipped and no fallback source is enabled.")
+			"ANNAS_SECRET_KEY is not set, so Anna's Archive fast_download was skipped, and no other source delivered the file.")
 	}
+
+	// failure is what gets reported if every remaining tier fails too.
+	failure := annaErr
 
 	// --- Tier 2: Libgen.li ---
 
-	if !cfg.LibgenEnabled || ctx.Err() != nil {
-		return nil, annaErr
+	if cfg.LibgenEnabled && ctx.Err() == nil {
+		logger.Info("download: trying libgen.li fallback", zap.String("hash", hash))
+		body, err := libgen.FetchByHash(ctx, client, cfg.LibgenBaseURL, hash)
+		if err == nil {
+			return dst.save(body, SourceLibgen, logger)
+		}
+		failure = bothFailed(ctx, annaErr, err)
 	}
 
-	logger.Info("download: trying libgen.li fallback", zap.String("hash", hash))
-	body, err := libgen.FetchByHash(ctx, client, cfg.LibgenBaseURL, hash)
-	if err != nil {
-		return nil, bothFailed(ctx, annaErr, err)
+	// --- Tier 3: Anna's Archive slow download (opt-in, needs a browser) ---
+
+	if cfg.SlowLink != nil && ctx.Err() == nil {
+		logger.Info("download: trying slow download", zap.String("hash", hash))
+		body, err := fetchSlow(ctx, client, cfg, hash)
+		if err == nil {
+			return dst.save(body, SourceSlowDownload, logger)
+		}
+		logger.Info("download: slow download failed", zap.String("hash", hash), zap.Error(err))
+		// A slow-download failure that says what to do (complete the manual
+		// check, wait for the other download) is the one to report: it is
+		// the tier that would have delivered the file. So is running out of
+		// time, which the tool boundary reports as a timeout or cancellation.
+		if userErr, ok := errors.AsType[*usererror.Error](err); ok {
+			return nil, userErr
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
 	}
-	return dst.save(body, SourceLibgen, logger)
+	return nil, failure
+}
+
+// slowSlot admits one slow download at a time: the partner servers refuse a
+// second simultaneous download from the same IP address.
+var slowSlot = make(chan struct{}, 1)
+
+// fetchSlow gets a partner-server link through the browser and opens it. The
+// returned body holds the slow-download slot until it is closed.
+func fetchSlow(ctx context.Context, client *httpclient.Client, cfg *config.Config, hash string) (io.ReadCloser, error) {
+	select {
+	case slowSlot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	release := func() { <-slowSlot }
+
+	body, err := openSlow(ctx, client, cfg, hash)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return &releasingBody{ReadCloser: body, release: release}, nil
+}
+
+func openSlow(ctx context.Context, client *httpclient.Client, cfg *config.Config, hash string) (io.ReadCloser, error) {
+	link, err := cfg.SlowLink(ctx, hash)
+	if err != nil {
+		return nil, fmt.Errorf("download: slow-download link for %s: %w", hash, err)
+	}
+
+	resp, err := client.Get(ctx, link, nil)
+	if err != nil {
+		if statusErr, ok := errors.AsType[*httpclient.StatusError](err); ok && statusErr.StatusCode == http.StatusTooManyRequests {
+			return nil, usererror.Wrap(usererror.CodeRateLimited,
+				"The slow-download server allows one download at a time per IP address, and another is in progress. Try again when it has finished.", err)
+		}
+		return nil, httpclient.SourceError("The slow-download server", fmt.Errorf("download: fetch slow-download file: %w", err))
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		return nil, usererror.New(usererror.CodeUpstreamRejected,
+			fmt.Sprintf("The slow-download server returned HTTP %d. Try again later.", resp.StatusCode))
+	}
+	if httpclient.IsHTML(resp) {
+		_ = resp.Body.Close()
+		return nil, usererror.New(usererror.CodeUpstreamRejected,
+			"The slow-download server returned a web page instead of the file. Try again later.")
+	}
+	return resp.Body, nil
+}
+
+// releasingBody runs release once when the body is closed.
+type releasingBody struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (b *releasingBody) Close() error {
+	defer b.once.Do(b.release)
+	return b.ReadCloser.Close()
 }
 
 // bothFailed picks the error to report when fast_download and Libgen have
@@ -203,9 +289,15 @@ func bothFailed(ctx context.Context, annaErr, libgenErr error) error {
 
 	switch {
 	// A rejected key or an exhausted quota is something the user can fix, and
-	// fixing it is usually what makes the file downloadable.
+	// fixing it is usually what makes the file downloadable. The Libgen
+	// outcome still matters: "no copy" means try another edition, an outage
+	// means try again.
 	case annaCode == usererror.CodeAuthInvalid, annaCode == usererror.CodeQuotaExhausted:
-		return usererror.Wrap(annaCode, annaUser.Message+" The Libgen fallback could not provide this file either.", libgenErr)
+		outcome := "The Libgen fallback failed as well; try again later."
+		if libgenUser != nil {
+			outcome = "Libgen fallback: " + libgenUser.Message
+		}
+		return usererror.Wrap(annaCode, annaUser.Message+" "+outcome, libgenErr)
 
 	// Neither source carries the file: the fast_download message already
 	// points at the page to download it from by hand.
