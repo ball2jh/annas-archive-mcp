@@ -42,7 +42,7 @@ func (l *rateLimiter) allow() error {
 
 	if l.used >= l.limit {
 		resetIn := l.window - now.Sub(l.start)
-		return usererror.New("LOCAL_RATE_LIMITED",
+		return usererror.New(usererror.CodeLocalRateLimited,
 			"Local rate limit exceeded for "+l.toolName+". Retry after "+resetIn.Round(time.Second).String()+".")
 	}
 

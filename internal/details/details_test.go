@@ -81,7 +81,7 @@ func TestGetDetailsSuccess(t *testing.T) {
 	client := newDetailsTestClient(t, srv)
 	logger := zaptest.NewLogger(t)
 
-	result, err := GetDetails(context.Background(), client, logger, hash)
+	result, err := GetDetails(context.Background(), client, logger, hash, 0)
 	if err != nil {
 		t.Fatalf("GetDetails: unexpected error: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestGetDetailsInvalidHash(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := GetDetails(context.Background(), client, logger, tc.hash)
+			result, err := GetDetails(context.Background(), client, logger, tc.hash, 0)
 			if err == nil {
 				t.Errorf("expected error for hash %q, got result: %+v", tc.hash, result)
 			}
@@ -215,7 +215,7 @@ func TestGetDetails404(t *testing.T) {
 	client := newDetailsTestClient(t, srv)
 	logger := zaptest.NewLogger(t)
 
-	result, err := GetDetails(context.Background(), client, logger, hash)
+	result, err := GetDetails(context.Background(), client, logger, hash, 0)
 	if err == nil {
 		t.Fatalf("expected error for 404 response, got result: %+v", result)
 	}

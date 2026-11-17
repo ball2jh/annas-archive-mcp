@@ -144,6 +144,9 @@ func TestResolvePrefixStripping(t *testing.T) {
 		{"https prefix", "https://doi.org/" + canonicalDOI},
 		{"http prefix", "http://doi.org/" + canonicalDOI},
 		{"doi colon prefix", "doi:" + canonicalDOI},
+		{"dx.doi.org prefix", "https://dx.doi.org/" + canonicalDOI},
+		{"uppercase prefix", "DOI:" + canonicalDOI},
+		{"surrounding whitespace", "  https://doi.org/" + canonicalDOI + "\n"},
 		{"bare doi", canonicalDOI},
 	}
 
@@ -196,5 +199,25 @@ func TestResolve404(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "404") {
 		t.Errorf("error %q does not mention 404", err.Error())
+	}
+}
+
+// DOIs may contain URL-significant characters; they must reach the server as
+// part of the path rather than being read as a query or fragment.
+func TestResolveEscapesDOIPath(t *testing.T) {
+	const doi = "10.1002/(SICI)1097-0258(19980815)17:15<1661::AID-SIM968>3.0.CO;2-2?x#y"
+	htmlBody := loadSciDBHTML(t)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/scidb/"+doi || r.URL.RawQuery != "" {
+			t.Errorf("path = %q, query = %q; want the whole DOI in the path", r.URL.Path, r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(htmlBody)
+	}))
+	defer srv.Close()
+
+	if _, err := Resolve(context.Background(), newDOITestClient(t, srv), zaptest.NewLogger(t), doi); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

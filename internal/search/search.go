@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -17,16 +19,22 @@ import (
 	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
-const maxConcurrency = 10
+// Options tunes the supplementary stats enrichment. Zero values are safe:
+// no separate stats deadline and one request at a time.
+type Options struct {
+	// StatsTimeout bounds the whole stats-enrichment phase.
+	StatsTimeout time.Duration
+	// MaxConcurrency caps parallel stats requests.
+	MaxConcurrency int
+}
 
 // Search performs a search on Anna's Archive and returns enriched results.
 //
 // Flow:
-//  1. Validate content type.
-//  2. Build the search URL path with query, content filter, and limit.
-//  3. Fetch and parse the search HTML page.
-//  4. Fetch community stats in parallel for each result's MD5 hash.
-//  5. Enrich each result with its stats and return, trimmed to limit.
+//  1. Validate the query and content type.
+//  2. Fetch and parse the search HTML page.
+//  3. Fetch community stats in parallel for each result's MD5 hash. Stats are
+//     best-effort: results whose stats fail or time out are returned without.
 func Search(
 	ctx context.Context,
 	client *httpclient.Client,
@@ -34,46 +42,47 @@ func Search(
 	query string,
 	contentType model.ContentType,
 	limit int,
+	opts Options,
 ) ([]model.SearchResult, error) {
-	if strings.TrimSpace(query) == "" {
-		return nil, usererror.New("INVALID_QUERY", "Search query is required.")
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, usererror.New(usererror.CodeInvalidQuery, "Search query is required.")
 	}
 	if !model.ValidContentType(contentType) {
-		return nil, usererror.New("INVALID_CONTENT_TYPE", fmt.Sprintf("content_type must be one of: %s.", validContentTypes()))
+		return nil, usererror.New(usererror.CodeInvalidContentType, fmt.Sprintf("content_type must be one of: %s.", validContentTypes()))
 	}
 
-	path := buildSearchPath(query, contentType, limit)
-
-	doc, err := client.GetHTML(ctx, path)
+	doc, err := client.GetHTML(ctx, buildSearchPath(query, contentType, limit))
 	if err != nil {
 		return nil, fmt.Errorf("search: fetch page: %w", err)
 	}
 
 	results := scraper.ParseSearchResults(doc, logger)
-	if len(results) == 0 {
-		return nil, nil
-	}
 
 	// Trim to the requested limit before fetching stats to avoid
 	// unnecessary API calls for results that will be discarded.
 	if limit > 0 && len(results) > limit {
 		results = results[:limit]
 	}
-
-	// Collect unique MD5 hashes for parallel stats fetch.
-	hashes := make([]string, 0, len(results))
-	for _, r := range results {
-		if r.Hash != "" {
-			hashes = append(hashes, r.Hash)
-		}
+	if len(results) == 0 {
+		return nil, nil
 	}
 
-	if len(hashes) > 0 {
-		statsMap := api.FetchStatsParallel(ctx, client, hashes, maxConcurrency, logger)
-		for i := range results {
-			if stats, ok := statsMap[results[i].Hash]; ok {
-				results[i].Stats = stats
-			}
+	hashes := make([]string, len(results))
+	for i, r := range results {
+		hashes[i] = r.Hash // ParseSearchResults drops entries without a hash
+	}
+
+	statsCtx := ctx
+	if opts.StatsTimeout > 0 {
+		var cancel context.CancelFunc
+		statsCtx, cancel = context.WithTimeout(ctx, opts.StatsTimeout)
+		defer cancel()
+	}
+	statsMap := api.FetchStatsParallel(statsCtx, client, hashes, opts.MaxConcurrency, logger)
+	for i := range results {
+		if stats, ok := statsMap[results[i].Hash]; ok {
+			results[i].Stats = stats
 		}
 	}
 
@@ -81,14 +90,9 @@ func Search(
 }
 
 func validContentTypes() string {
-	values := []string{
-		string(model.ContentTypeBookAny),
-		string(model.ContentTypeBookFiction),
-		string(model.ContentTypeBookNonfiction),
-		string(model.ContentTypeBookComic),
-		string(model.ContentTypeJournal),
-		string(model.ContentTypeMagazine),
-		string(model.ContentTypeStandardsDocument),
+	values := make([]string, len(model.ContentTypes))
+	for i, ct := range model.ContentTypes {
+		values[i] = string(ct)
 	}
 	return strings.Join(values, ", ")
 }
@@ -105,7 +109,7 @@ func buildSearchPath(query string, contentType model.ContentType, limit int) str
 	}
 
 	if limit > 0 {
-		params.Set("limit", fmt.Sprintf("%d", limit))
+		params.Set("limit", strconv.Itoa(limit))
 	}
 
 	return "/search?" + params.Encode()

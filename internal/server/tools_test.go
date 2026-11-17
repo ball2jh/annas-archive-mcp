@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -347,7 +350,7 @@ func TestToolErrorClassifiesCommonFailures(t *testing.T) {
 		},
 		{
 			name:      "details not found",
-			operation: "details",
+			operation: toolGetDetails,
 			err:       &httpclient.StatusError{StatusCode: http.StatusNotFound},
 			wantCode:  "[NOT_FOUND]",
 		},
@@ -356,6 +359,30 @@ func TestToolErrorClassifiesCommonFailures(t *testing.T) {
 			operation: "search",
 			err:       &httpclient.StatusError{StatusCode: http.StatusBadGateway},
 			wantCode:  "[UPSTREAM_UNAVAILABLE]",
+		},
+		{
+			name:      "stalled transfer",
+			operation: toolDownload,
+			err:       fmt.Errorf("download: transfer interrupted: %w", context.DeadlineExceeded),
+			wantCode:  "[REQUEST_TIMEOUT]",
+		},
+		{
+			name:      "network timeout",
+			operation: toolSearch,
+			err:       &net.DNSError{IsTimeout: true},
+			wantCode:  "[REQUEST_TIMEOUT]",
+		},
+		{
+			name:      "cancelled",
+			operation: toolSearch,
+			err:       fmt.Errorf("httpclient: %w", context.Canceled),
+			wantCode:  "[REQUEST_CANCELLED]",
+		},
+		{
+			name:      "unclassified error does not leak its text",
+			operation: toolLookupDOI,
+			err:       errors.New("scraper: scidb left menu not found"),
+			wantCode:  "[DOI_LOOKUP_FAILED]",
 		},
 	}
 
@@ -390,7 +417,7 @@ func TestToolRateLimit(t *testing.T) {
 }
 
 func TestToolAnnotations(t *testing.T) {
-	srv := New(&config.Config{}, nil, zaptest.NewLogger(t))
+	srv := New(&config.Config{}, nil, zaptest.NewLogger(t), "test")
 	clientTransport, serverTransport := mcp.NewInMemoryTransports()
 
 	serverSession, err := srv.Connect(context.Background(), serverTransport, nil)
@@ -561,5 +588,24 @@ func TestDetailsHandlerInvalidHash(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "[INVALID_HASH]") {
 		t.Errorf("error does not contain [INVALID_HASH]: %q", err.Error())
+	}
+}
+
+// An empty result set must encode as [] so clients validating the output
+// schema never see null.
+func TestSearchHandlerEmptyResultsAreNotNull(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<html><body>No files found.</body></html>"))
+	}))
+	defer srv.Close()
+
+	handler := searchHandler(&config.Config{}, newErrorBoundaryClient(t, srv), zaptest.NewLogger(t))
+	_, out, err := handler(context.Background(), &mcp.CallToolRequest{}, SearchInput{Query: "nothing"})
+	if err != nil {
+		t.Fatalf("handler returned error: %v", err)
+	}
+	if out.Results == nil || out.Count != 0 {
+		t.Fatalf("out = %+v, want empty non-nil Results", out)
 	}
 }

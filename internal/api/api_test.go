@@ -15,6 +15,7 @@ import (
 
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 	"github.com/ball2jh/annas-archive-mcp/internal/model"
+	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
 // newAPITestClient returns an httpclient.Client wired to the given TLS test
@@ -340,4 +341,36 @@ func chainContains(err error, sub string) bool {
 		err = errors.Unwrap(err)
 	}
 	return false
+}
+
+// A rejected key or exhausted quota fails identically on every domain index,
+// so only one request should be spent discovering it.
+func TestResolveDownloadURLStopsOnDefinitiveError(t *testing.T) {
+	cases := []struct {
+		name     string
+		apiError string
+		wantCode string
+	}{
+		{"invalid key", "Invalid secret key", usererror.CodeAuthInvalid},
+		{"quota", "No downloads left: daily download limit reached", usererror.CodeQuotaExhausted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"download_url": null, "error": %q}`, tc.apiError)
+			}))
+			defer srv.Close()
+
+			_, err := ResolveDownloadURL(context.Background(), newAPITestClient(t, srv), "abc", "key")
+			if !usererror.HasCode(err, tc.wantCode) {
+				t.Fatalf("error = %v, want code %s", err, tc.wantCode)
+			}
+			if n := calls.Load(); n != 1 {
+				t.Errorf("made %d request(s), want 1", n)
+			}
+		})
+	}
 }

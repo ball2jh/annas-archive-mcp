@@ -1,6 +1,11 @@
 // Package model defines all shared data types for the Anna's Archive MCP server.
 package model
 
+import (
+	"regexp"
+	"strings"
+)
+
 // ContentType represents the type of content to search for on Anna's Archive.
 type ContentType string
 
@@ -13,6 +18,17 @@ const (
 	ContentTypeMagazine          ContentType = "magazine"
 	ContentTypeStandardsDocument ContentType = "standards_document"
 )
+
+// ContentTypes lists every supported content type in display order.
+var ContentTypes = []ContentType{
+	ContentTypeBookAny,
+	ContentTypeBookFiction,
+	ContentTypeBookNonfiction,
+	ContentTypeBookComic,
+	ContentTypeJournal,
+	ContentTypeMagazine,
+	ContentTypeStandardsDocument,
+}
 
 // ContentTypePath maps a ContentType to the URL path segment used on Anna's Archive.
 // An empty string means no filter is applied (the default "book_any" case).
@@ -30,6 +46,16 @@ var ContentTypePath = map[ContentType]string{
 func ValidContentType(ct ContentType) bool {
 	_, ok := ContentTypePath[ct]
 	return ok
+}
+
+var md5RE = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// NormalizeHash trims and lower-cases an MD5 hash, reporting whether the
+// result is a valid 32-character hex string. Anna's Archive and Libgen both
+// key on the lowercase form.
+func NormalizeHash(raw string) (string, bool) {
+	hash := strings.ToLower(strings.TrimSpace(raw))
+	return hash, md5RE.MatchString(hash)
 }
 
 // CommunityStats holds community engagement data for an item.

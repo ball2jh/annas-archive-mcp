@@ -115,10 +115,52 @@ func TestSanitizeFilename(t *testing.T) {
 			want:   strings.Repeat("a", 200) + ".pdf",
 		},
 		{
-			name:   "unicode title preserved and truncated correctly",
+			name:   "multi-byte title truncated to 200 bytes on a rune boundary",
 			title:  strings.Repeat("ä", 210),
 			format: "pdf",
-			want:   strings.Repeat("ä", 200) + ".pdf",
+			want:   strings.Repeat("ä", 100) + ".pdf",
+		},
+		{
+			name:   "truncation never splits a rune",
+			title:  "a" + strings.Repeat("ä", 150),
+			format: "pdf",
+			want:   "a" + strings.Repeat("ä", 99) + ".pdf",
+		},
+		{
+			name:   "dot-dot cannot escape the directory",
+			title:  "..",
+			format: "pdf",
+			want:   "download.pdf",
+		},
+		{
+			name:   "traversal attempt is flattened",
+			title:  "../../etc/passwd",
+			format: "",
+			want:   ".._.._etc_passwd",
+		},
+		{
+			name:   "control characters replaced",
+			title:  "Line\nBreak\x00Null",
+			format: "pdf",
+			want:   "Line_Break_Null.pdf",
+		},
+		{
+			name:   "leading dot on format dropped",
+			title:  "Book",
+			format: ".epub",
+			want:   "Book.epub",
+		},
+		{
+			name:   "path separators in format replaced",
+			title:  "Book",
+			format: "../sh",
+			want:   "Book._sh",
+		},
+		{
+			name:   "trailing dots and spaces trimmed",
+			title:  "Vol. 1. ",
+			format: "pdf",
+			want:   "Vol. 1.pdf",
 		},
 	}
 

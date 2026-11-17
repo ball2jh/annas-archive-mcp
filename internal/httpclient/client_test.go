@@ -365,7 +365,7 @@ func TestGetHelperSetsUserAgent(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if gotUA != userAgent {
+	if gotUA != userAgent { // default UA
 		t.Errorf("want User-Agent %q, got %q", userAgent, gotUA)
 	}
 }

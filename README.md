@@ -16,12 +16,14 @@ Search across all Anna's Archive content types. Returns human-readable text and 
 Returns title, authors, format, size, language, MD5 hash, and community stats (downloads, lists, reports).
 
 ### `download`
-Download a file by MD5 hash. Requires `ANNAS_DOWNLOAD_PATH`. Uses Anna's fast_download API when `ANNAS_SECRET_KEY` is configured, then falls back to Libgen when enabled. Saves only inside the configured download directory and skips the network call when the target file already exists.
+Download a file by MD5 hash. Requires `ANNAS_DOWNLOAD_PATH`. Uses Anna's fast_download API when `ANNAS_SECRET_KEY` is configured, then falls back to Libgen when enabled. Saves only inside the configured download directory.
+
+The saved file is named `<title>.<format>`. If a non-empty file with that name already exists, the call returns it without making any request (and without using quota) — so pick a different title to download a different edition of the same book.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `hash` | Yes | MD5 hash from search results |
-| `title` | Yes | Used for the filename |
+| `title` | Yes | Used for the filename (falls back to the hash when empty) |
 | `format` | Yes | File extension (`pdf`, `epub`, etc.) |
 
 Returns the saved file path, whether an existing file was reused, and the source that delivered the file (`fast_download`, `libgen.li`, or `cache`).
@@ -36,11 +38,11 @@ Resolve a DOI to paper metadata and a downloadable hash.
 Returns title, authors, journal, year, DOI, and MD5 hash.
 
 ### `download_by_doi`
-Download a paper by DOI. Requires `ANNAS_DOWNLOAD_PATH`. Tries Anna's Archive by resolving DOI to MD5 first, then falls back to Sci-Net when Anna's path is unavailable. `ANNAS_SECRET_KEY` improves the Anna's fast_download path but is not required for Sci-Net fallback.
+Download a paper by DOI. Requires `ANNAS_DOWNLOAD_PATH`. Resolves the DOI to an MD5 on Anna's Archive and downloads it the same way as `download` (fast_download, then Libgen); if that fails, falls back to Sci-Net. `ANNAS_SECRET_KEY` is not required for the Libgen and Sci-Net paths.
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `doi` | Yes | — | DOI identifier, e.g. `10.1038/nature12373` |
+| `doi` | Yes | — | DOI identifier, e.g. `10.1038/nature12373` (`doi:` and `https://doi.org/` prefixes are accepted) |
 | `title` | No | DOI | Used for the filename |
 | `format` | No | `pdf` | File extension |
 
@@ -72,10 +74,13 @@ Tool execution errors are returned as MCP tool errors with stable codes, so agen
 - Rate / quota: `[RATE_LIMITED]`, `[LOCAL_RATE_LIMITED]`, `[QUOTA_EXHAUSTED]`
 - Transport: `[REQUEST_TIMEOUT]`, `[REQUEST_CANCELLED]`
 - Upstream: `[UPSTREAM_BLOCKED]`, `[UPSTREAM_REJECTED]`, `[UPSTREAM_UNAVAILABLE]`, `[UPSTREAM_API_ERROR]`, `[NOT_FOUND]`, `[NOT_FOUND_ON_LIBGEN]`, `[NOT_FOUND_ON_SCINET]`, `[NOT_FAST_DOWNLOADABLE]`
+- Unclassified (one per tool): `[SEARCH_FAILED]`, `[DOWNLOAD_FAILED]`, `[DOI_DOWNLOAD_FAILED]`, `[DOI_LOOKUP_FAILED]`, `[DETAILS_FAILED]`
 
-Internal URLs, secret keys, and raw upstream error details are logged for debugging but not returned to the caller.
+Internal URLs and raw upstream error details are logged to stderr for debugging but never returned to the caller. `ANNAS_SECRET_KEY` is redacted from logs as well.
 
 ## Install
+
+Requires Go 1.26 or newer.
 
 ```bash
 go install github.com/ball2jh/annas-archive-mcp/cmd/annas-archive-mcp@latest
@@ -88,6 +93,8 @@ git clone https://github.com/ball2jh/annas-archive-mcp.git
 cd annas-archive-mcp
 go build -o annas-archive-mcp ./cmd/annas-archive-mcp/
 ```
+
+`annas-archive-mcp --version` prints the installed version.
 
 ## Configure
 
@@ -124,17 +131,37 @@ All via environment variables:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `ANNAS_SECRET_KEY` | For downloads | — | Anna's Archive membership key |
-| `ANNAS_DOWNLOAD_PATH` | For downloads | — | Absolute path for saved files |
-| `ANNAS_BASE_URL` | No | `annas-archive.gl` | Primary mirror hostname |
+| `ANNAS_DOWNLOAD_PATH` | For downloads | — | Directory for saved files. A leading `~` is expanded; use an absolute path otherwise. |
+| `ANNAS_BASE_URL` | No | `annas-archive.gl` | Primary mirror hostname (no path) |
 | `SCINET_BASE_URL` | No | `sci-net.xyz` | Sci-Net fallback hostname for `download_by_doi` |
 | `LIBGEN_BASE_URL` | No | `libgen.li` | Libgen fallback hostname for `download` |
 | `LIBGEN_ENABLED` | No | `true` | Enables Libgen fallback for `download` |
-| `ANNAS_HTTP_TIMEOUT` | No | `30s` | HTTP request timeout |
-| `ANNAS_STATS_TIMEOUT` | No | `5s` | Community stats fetch timeout |
-| `ANNAS_MAX_RETRIES` | No | `3` | Retry attempts on failure |
-| `ANNAS_MAX_CONCURRENCY` | No | `10` | Parallel request cap |
+| `ANNAS_HTTP_TIMEOUT` | No | `30s` | How long a request may stall (no response, or no new data) before it is abandoned. Not a limit on total download time. |
+| `ANNAS_STATS_TIMEOUT` | No | `5s` | Time allowed for community stats; results are returned without stats when it elapses |
+| `ANNAS_MAX_RETRIES` | No | `3` | Retry attempts on network errors, 429 and 5xx |
+| `ANNAS_MAX_CONCURRENCY` | No | `10` | Parallel community-stats request cap |
 | `ANNAS_TOOL_RATE_LIMIT_PER_MINUTE` | No | `60` | Per-tool local call cap. Set `0` to disable. |
 | `ANNAS_LOG_LEVEL` | No | `warn` | Log level (`debug`, `info`, `warn`, `error`) |
+| `ANNAS_BROWSER` | No | `auto` | `auto` opens Chrome when needed to pass the browser check; `off` never does |
+| `ANNAS_CHROME_PATH` | No | found on `PATH` | Chrome or Chromium binary to use for the browser check |
+| `ANNAS_SESSION_FILE` | No | `<user config dir>/annas-archive-mcp/session.json` | Where the browser session is saved. The Chrome profile lives beside it. |
+
+## Browser check (DDoS-Guard)
+
+Anna's Archive puts its search, detail and DOI pages behind a DDoS-Guard "Checking your browser" page. That check runs JavaScript and cannot be answered by an HTTP client, so the server borrows a session from a real browser:
+
+1. When a request is met with the check, the server opens a Chrome window on a guarded page. The window uses its own profile directory, never your everyday one.
+2. Chrome passes the check by itself, usually within seconds and at most a minute — there is nothing to click. The server reads the resulting cookies and Chrome's User-Agent, then closes the window.
+3. The session is saved to `session.json` in your user config directory (`~/.config/annas-archive-mcp/` on Linux, mode 600) and sent with every later request, straight from the server. Chrome is only opened again when the site starts challenging again.
+
+So the first search after installing takes noticeably longer and briefly shows a window; after that, calls go direct. Several server processes share the same session file.
+
+Requirements and limits:
+
+- Google Chrome or Chromium must be installed, and the server must run in a desktop session: headless Chrome does not pass the check.
+- Linux and macOS only for now. On Windows, and on machines without a display, the affected tools return `[UPSTREAM_BLOCKED]`.
+- The session file holds live cookies for the site. Treat it like a credential.
+- Set `ANNAS_BROWSER=off` to never open a window. The JSON endpoints (community stats, fast_download) are not behind the check, so `download` by hash keeps working either way.
 
 ## Operational notes
 
@@ -152,7 +179,9 @@ All via environment variables:
 cmd/annas-archive-mcp/main.go    Entry point: config, logger, HTTP client, MCP server
 internal/
   config/       Env var loading, validation, defaults
-  httpclient/   HTTP client with retry, backoff, DDoS-Guard detection
+  httpclient/   HTTP client with retry, backoff, DDoS-Guard detection and recovery
+  browser/      Passes the DDoS-Guard browser check with a real Chrome window
+  session/      Saved browser session (cookies, User-Agent) and its renewal
   scraper/      HTML parsing with CSS selector chains + fallbacks
   api/          JSON API wrappers (inline_info, fast_download)
   libgen/       Libgen fallback downloads by MD5
@@ -170,7 +199,8 @@ testdata/       Saved HTML snapshots for scraper tests
 ## Testing
 
 ```bash
-go test ./...
+go vet ./...
+go test -race ./...
 ```
 
 Tests run against saved HTML snapshots and `httptest` servers — no network access required.

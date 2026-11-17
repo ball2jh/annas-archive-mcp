@@ -12,15 +12,17 @@ func boolPtr(v bool) *bool {
 	return &v
 }
 
-// New creates a configured MCP server with all Anna's Archive tools registered.
-func New(cfg *config.Config, client *httpclient.Client, logger *zap.Logger) *mcp.Server {
+// New creates a configured MCP server with all Anna's Archive tools
+// registered. version is reported to clients during the MCP handshake.
+func New(cfg *config.Config, client *httpclient.Client, logger *zap.Logger, version string) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    "annas-archive",
-		Version: "1.0.0",
+		Title:   "Anna's Archive",
+		Version: version,
 	}, nil)
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "search",
+		Name:        toolSearch,
 		Title:       "Search Anna's Archive",
 		Description: "Search Anna's Archive for books, articles, and other documents. Returns concise text plus structured results with title, authors, format, size, language, MD5 hash, and community stats.",
 		Annotations: &mcp.ToolAnnotations{
@@ -30,9 +32,9 @@ func New(cfg *config.Config, client *httpclient.Client, logger *zap.Logger) *mcp
 	}, searchHandler(cfg, client, logger))
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "download",
+		Name:        toolDownload,
 		Title:       "Download Anna's Archive File",
-		Description: "Download a file by MD5 hash into ANNAS_DOWNLOAD_PATH. Requires ANNAS_SECRET_KEY. Skips the network call when the target file already exists, and returns the saved file path.",
+		Description: "Download a file by MD5 hash into the configured download directory. Uses Anna's Archive fast_download when a membership key is configured, then falls back to Libgen. Skips the download when a file with the same title and format already exists. Returns the saved file path and which source delivered it.",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    false,
 			DestructiveHint: boolPtr(false),
@@ -42,7 +44,7 @@ func New(cfg *config.Config, client *httpclient.Client, logger *zap.Logger) *mcp
 	}, downloadHandler(cfg, client, logger))
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "lookup_doi",
+		Name:        toolLookupDOI,
 		Title:       "Look Up DOI",
 		Description: "Resolve a DOI to paper metadata and an Anna's Archive MD5 hash that can be passed to download or get_details.",
 		Annotations: &mcp.ToolAnnotations{
@@ -52,7 +54,7 @@ func New(cfg *config.Config, client *httpclient.Client, logger *zap.Logger) *mcp
 	}, doiHandler(cfg, client, logger))
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "get_details",
+		Name:        toolGetDetails,
 		Title:       "Get Anna's Archive Details",
 		Description: "Get metadata for an Anna's Archive item by 32-character MD5 hash, including identifiers, file info, cleaned description, and community stats.",
 		Annotations: &mcp.ToolAnnotations{
@@ -62,9 +64,9 @@ func New(cfg *config.Config, client *httpclient.Client, logger *zap.Logger) *mcp
 	}, detailsHandler(cfg, client, logger))
 
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "download_by_doi",
+		Name:        toolDownloadByDOI,
 		Title:       "Download Paper by DOI",
-		Description: "Download a paper by DOI. Tries Anna's Archive fast_download first, then falls back to Sci-Net. Requires ANNAS_DOWNLOAD_PATH. ANNAS_SECRET_KEY enables the Anna's path; without it only Sci-Net is used. Skips the download when the target file already exists. Returns the saved path and which source succeeded.",
+		Description: "Download a paper by DOI into the configured download directory. Resolves the DOI on Anna's Archive and downloads it (fast_download, then Libgen), falling back to Sci-Net when that fails. Skips the download when a file with the same title and format already exists. Returns the saved file path and which source delivered it.",
 		Annotations: &mcp.ToolAnnotations{
 			ReadOnlyHint:    false,
 			DestructiveHint: boolPtr(false),

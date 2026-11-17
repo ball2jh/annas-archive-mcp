@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
@@ -26,16 +28,22 @@ var domainIndexFallbacks = []int{0, 1, 2}
 
 // ResolveDownloadURL retrieves the download URL for a file identified by its
 // MD5 hash. It tries domain_index values 0, 1, 2 in order and returns the
-// first successful URL.
+// first successful URL, stopping early on errors no other index can fix.
 func ResolveDownloadURL(ctx context.Context, client *httpclient.Client, hash, secretKey string) (string, error) {
 	var lastErr error
 
 	for _, domainIdx := range domainIndexFallbacks {
-		url, err := resolveSingle(ctx, client, hash, secretKey, domainIdx)
+		downloadURL, err := resolveSingle(ctx, client, hash, secretKey, domainIdx)
 		if err == nil {
-			return url, nil
+			return downloadURL, nil
 		}
 		lastErr = err
+
+		// A rejected key, an exhausted quota, or a cancelled request will fail
+		// identically on every domain index — don't spend more requests on it.
+		if ctx.Err() != nil || usererror.HasCode(err, usererror.CodeAuthInvalid, usererror.CodeQuotaExhausted) {
+			break
+		}
 	}
 
 	return "", fmt.Errorf("api: ResolveDownloadURL %s: all domain indices failed: %w", hash, lastErr)
@@ -53,7 +61,7 @@ func resolveSingle(ctx context.Context, client *httpclient.Client, hash, secretK
 	params.Set("md5", hash)
 	params.Set("key", secretKey)
 	params.Set("path_index", "0")
-	params.Set("domain_index", fmt.Sprintf("%d", domainIndex))
+	params.Set("domain_index", strconv.Itoa(domainIndex))
 	path := "/dyn/api/fast_download.json?" + params.Encode()
 
 	data, status, err := client.GetJSONStatus(ctx, path, nil)
@@ -63,12 +71,8 @@ func resolveSingle(ctx context.Context, client *httpclient.Client, hash, secretK
 
 	// 401/403/404/429/5xx — treat as HTTP failure (body may not be JSON).
 	// 200 and 400 both carry the structured JSON body we need to inspect.
-	if status != 200 && status != 400 {
-		return "", &httpclient.StatusError{
-			Operation:  "fast_download",
-			Path:       sanitizeAPIPath(hash, domainIndex),
-			StatusCode: status,
-		}
+	if status != http.StatusOK && status != http.StatusBadRequest {
+		return "", httpclient.NewStatusError("fast_download", sanitizeAPIPath(hash, domainIndex), status, data)
 	}
 
 	var raw fastDownloadResponse
@@ -82,12 +86,12 @@ func resolveSingle(ctx context.Context, client *httpclient.Client, hash, secretK
 		lower := strings.ToLower(raw.Error)
 		switch {
 		case strings.Contains(lower, "secret key"):
-			return "", usererror.Wrap("AUTH_INVALID",
+			return "", usererror.Wrap(usererror.CodeAuthInvalid,
 				"Anna's Archive rejected ANNAS_SECRET_KEY. Update the key in your MCP configuration.", err)
 		case strings.Contains(lower, "daily download limit"),
 			strings.Contains(lower, "quota"),
 			strings.Contains(lower, "limit reached"):
-			return "", usererror.Wrap("QUOTA_EXHAUSTED",
+			return "", usererror.Wrap(usererror.CodeQuotaExhausted,
 				"Anna's Archive daily download quota reached. The limit resets every 24 hours; higher donation tiers have larger quotas.", err)
 		case strings.Contains(lower, "invalid domain_index"),
 			strings.Contains(lower, "invalid path_index"):
@@ -95,13 +99,13 @@ func resolveSingle(ctx context.Context, client *httpclient.Client, hash, secretK
 			// reachable via external collections (Libgen.li, SciNet, Z-Library,
 			// etc.). Give the user a direct link to the file's page so they can
 			// download manually.
-			return "", usererror.Wrap("NOT_FAST_DOWNLOADABLE",
-				fmt.Sprintf("This file is not available via Anna's Archive's fast_download API; it lives in an external collection (Libgen, SciNet, Z-Library, etc.) that the API cannot proxy. Download it manually at https://annas-archive.org/md5/%s.", hash),
+			return "", usererror.Wrap(usererror.CodeNotFastDownloadable,
+				fmt.Sprintf("This file is not available via Anna's Archive's fast_download API; it lives in an external collection (Libgen, SciNet, Z-Library, etc.) that the API cannot proxy. Download it manually at https://%s/md5/%s.", client.BaseURL(), hash),
 				err)
 		}
 		// Unknown API error — surface the raw message so the user learns
 		// something actionable instead of the opaque fallback.
-		return "", usererror.Wrap("UPSTREAM_API_ERROR",
+		return "", usererror.Wrap(usererror.CodeUpstreamApiError,
 			fmt.Sprintf("Anna's Archive API error: %s", raw.Error), err)
 	}
 

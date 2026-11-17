@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -17,24 +18,43 @@ import (
 	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
-// hashRE matches a valid 32-character hexadecimal MD5 hash.
-var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 var dateOnlyRE = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 var sourceIDRE = regexp.MustCompile(`^(lg|libgen|zlib)[a-z0-9_-]*\d*$`)
 
 // GetDetails fetches full metadata for an item by MD5 hash.
 //
-// Flow:
-//  1. Validate that hash is exactly 32 hex characters.
-//  2. Fetch the detail page: GET /md5/{hash}.
-//  3. Parse the HTML with scraper.ParseDetailPage.
-//  4. If the scraper did not populate the hash, set it from the input.
-//  5. Fetch community stats via api.FetchStats.
-//  6. Attach stats to the result and return.
-func GetDetails(ctx context.Context, client *httpclient.Client, logger *zap.Logger, hash string) (*model.BookDetails, error) {
-	if !hashRE.MatchString(hash) {
-		return nil, usererror.New("INVALID_HASH", "hash must be a 32-character MD5 hex string.")
+// The detail page (GET /md5/{hash}) and the community stats (inline_info API)
+// are fetched concurrently. Stats are supplementary: if they fail or exceed
+// statsTimeout, the scraped metadata is returned without them. A zero
+// statsTimeout means no separate limit.
+func GetDetails(
+	ctx context.Context,
+	client *httpclient.Client,
+	logger *zap.Logger,
+	rawHash string,
+	statsTimeout time.Duration,
+) (*model.BookDetails, error) {
+	hash, ok := model.NormalizeHash(rawHash)
+	if !ok {
+		return nil, usererror.New(usererror.CodeInvalidHash, "hash must be a 32-character MD5 hex string.")
 	}
+
+	statsCtx, cancelStats := context.WithCancel(ctx)
+	defer cancelStats()
+	if statsTimeout > 0 {
+		statsCtx, cancelStats = context.WithTimeout(statsCtx, statsTimeout)
+		defer cancelStats()
+	}
+
+	type statsResult struct {
+		stats model.CommunityStats
+		err   error
+	}
+	statsCh := make(chan statsResult, 1)
+	go func() {
+		stats, err := api.FetchStats(statsCtx, client, hash)
+		statsCh <- statsResult{stats, err}
+	}()
 
 	doc, err := client.GetHTML(ctx, "/md5/"+hash)
 	if err != nil {
@@ -51,16 +71,13 @@ func GetDetails(ctx context.Context, client *httpclient.Client, logger *zap.Logg
 	}
 	result.Description = cleanDescription(result.Description)
 
-	stats, err := api.FetchStats(ctx, client, hash)
-	if err != nil {
-		// Soft-fail: stats are supplementary. Log the error but return
-		// the metadata we already scraped rather than failing the whole call.
+	if sr := <-statsCh; sr.err != nil {
 		logger.Warn("details: stats unavailable, returning metadata without stats",
 			zap.String("hash", hash),
-			zap.Error(err),
+			zap.Error(sr.err),
 		)
 	} else {
-		result.Stats = stats
+		result.Stats = sr.stats
 	}
 
 	return result, nil

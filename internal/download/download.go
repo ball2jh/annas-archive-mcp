@@ -8,19 +8,30 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
+	"strings"
 
 	"go.uber.org/zap"
 
 	"github.com/ball2jh/annas-archive-mcp/internal/api"
 	"github.com/ball2jh/annas-archive-mcp/internal/config"
+	"github.com/ball2jh/annas-archive-mcp/internal/doi"
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 	"github.com/ball2jh/annas-archive-mcp/internal/libgen"
 	"github.com/ball2jh/annas-archive-mcp/internal/model"
+	"github.com/ball2jh/annas-archive-mcp/internal/scinet"
 	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
-var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
+// Source names reported in DownloadResult.Source.
+const (
+	SourceFastDownload = "fast_download"
+	SourceLibgen       = "libgen.li"
+	SourceSciNet       = "sci-net"
+	SourceCache        = "cache"
+)
+
+// defaultDOIFormat is the extension used by ByDOI when none is given.
+const defaultDOIFormat = "pdf"
 
 // Download fetches a file by MD5 hash and saves it atomically under
 // cfg.DownloadPath. It tries two sources in order:
@@ -29,76 +40,140 @@ var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 //  2. Libgen.li (no key required; opt out with LIBGEN_ENABLED=false).
 //
 // On success, the returned DownloadResult.Source records which tier delivered
-// the file ("fast_download", "libgen.li", or "cache" if skip-if-exists fired).
+// the file (SourceFastDownload, SourceLibgen, or SourceCache when the target
+// file already existed and no request was made).
 //
-// Errors are always *usererror.Error (directly or via Unwrap) so the MCP
-// tool-handler boundary can render structured, actionable messages.
+// Validation, auth, and upstream-content failures are *usererror.Error;
+// transport failures are returned wrapped for the tool boundary to classify.
 func Download(
 	ctx context.Context,
 	client *httpclient.Client,
 	logger *zap.Logger,
 	cfg *config.Config,
-	hash, title, format string,
+	rawHash, title, format string,
 ) (*model.DownloadResult, error) {
-	// --- Input validation (bubble up; no fallback can help) ---
-
 	if cfg.DownloadPath == "" {
-		return nil, usererror.New("PATH_REQUIRED",
-			"Downloads require a download path. Set ANNAS_DOWNLOAD_PATH in your MCP server configuration.")
+		return nil, errPathRequired()
 	}
-	if !hashRE.MatchString(hash) {
-		return nil, usererror.New("INVALID_HASH", "hash must be a 32-character MD5 hex string.")
+	hash, ok := model.NormalizeHash(rawHash)
+	if !ok {
+		return nil, usererror.New(usererror.CodeInvalidHash, "hash must be a 32-character MD5 hex string.")
 	}
-	info, err := os.Stat(cfg.DownloadPath)
+	if strings.TrimSpace(title) == "" {
+		title = hash
+	}
+
+	dst, err := newTarget(cfg, title, format)
 	if err != nil {
-		return nil, usererror.Wrap("PATH_UNAVAILABLE",
-			"ANNAS_DOWNLOAD_PATH is not accessible. Check that the directory exists and Codex can write to it.", err)
+		return nil, err
 	}
-	if !info.IsDir() {
-		return nil, usererror.New("PATH_UNAVAILABLE", "ANNAS_DOWNLOAD_PATH must be a directory.")
+	if cached := dst.cached(logger); cached != nil {
+		return cached, nil
+	}
+	return fetchByHash(ctx, client, logger, cfg, hash, dst)
+}
+
+// ByDOI downloads a paper by DOI. It resolves the DOI to an MD5 hash on
+// Anna's Archive and runs the same tiers as Download; when Anna's Archive
+// cannot deliver the paper it falls back to Sci-Net, which needs no key.
+//
+// The filename is derived from title, or from the DOI when title is empty.
+// format defaults to "pdf".
+func ByDOI(
+	ctx context.Context,
+	client *httpclient.Client,
+	logger *zap.Logger,
+	cfg *config.Config,
+	rawDOI, title, format string,
+) (*model.DownloadResult, error) {
+	cleaned, err := doi.Clean(rawDOI)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(title) == "" {
+		title = cleaned
+	}
+	if strings.TrimSpace(format) == "" {
+		format = defaultDOIFormat
 	}
 
-	filename := SanitizeFilename(title, format)
-	if title == "" {
-		filename = SanitizeFilename(hash, format)
+	dst, err := newTarget(cfg, title, format)
+	if err != nil {
+		return nil, err
 	}
-	finalPath := filepath.Join(cfg.DownloadPath, filename)
-
-	// --- Skip-if-exists: preserves API quota on every tier ---
-
-	if fi, err := os.Stat(finalPath); err == nil && !fi.IsDir() && fi.Size() > 0 {
-		logger.Info("download skipped — file already exists",
-			zap.String("path", finalPath), zap.Int64("size", fi.Size()))
-		return &model.DownloadResult{
-			FilePath:       finalPath,
-			Message:        "File already exists — download skipped.",
-			AlreadyExisted: true,
-			Source:         "cache",
-		}, nil
+	if cached := dst.cached(logger); cached != nil {
+		return cached, nil
 	}
 
+	result, annaErr := byDOIViaAnna(ctx, client, logger, cfg, cleaned, dst)
+	if annaErr == nil {
+		return result, nil
+	}
+	// A cancelled request or a local write failure will not go better on
+	// another source.
+	if ctx.Err() != nil || usererror.HasCode(annaErr, usererror.CodeIOError) {
+		return nil, annaErr
+	}
+	logger.Info("download: Anna's Archive could not deliver DOI, trying sci-net",
+		zap.String("doi", cleaned), zap.Error(annaErr))
+
+	body, _, err := scinet.FetchPDF(ctx, client, cfg.ScinetBaseURL, cleaned)
+	if err != nil {
+		return nil, err
+	}
+	return dst.save(body, SourceSciNet, logger)
+}
+
+// byDOIViaAnna resolves the DOI to a hash and downloads it by hash.
+func byDOIViaAnna(
+	ctx context.Context,
+	client *httpclient.Client,
+	logger *zap.Logger,
+	cfg *config.Config,
+	cleanedDOI string,
+	dst target,
+) (*model.DownloadResult, error) {
+	meta, err := doi.Resolve(ctx, client, logger, cleanedDOI)
+	if err != nil {
+		return nil, fmt.Errorf("download: resolve DOI: %w", err)
+	}
+	hash, ok := model.NormalizeHash(meta.Hash)
+	if !ok {
+		return nil, usererror.New(usererror.CodeNotFound, "Anna's Archive has no downloadable file for this DOI.")
+	}
+	return fetchByHash(ctx, client, logger, cfg, hash, dst)
+}
+
+// fetchByHash runs the fast_download → Libgen tiers for an already-validated
+// hash and saves the result to dst.
+func fetchByHash(
+	ctx context.Context,
+	client *httpclient.Client,
+	logger *zap.Logger,
+	cfg *config.Config,
+	hash string,
+	dst target,
+) (*model.DownloadResult, error) {
 	// --- Tier 1: Anna's Archive fast_download (when key available) ---
 
 	var annaErr error
 	if cfg.SecretKey != "" {
 		body, err := fetchFromAnna(ctx, client, logger, cfg, hash)
 		if err == nil {
-			return writeAndResult(cfg.DownloadPath, filename, body, "fast_download", logger)
+			return dst.save(body, SourceFastDownload, logger)
 		}
 		annaErr = err
 		logger.Info("download: fast_download failed, evaluating fallback",
 			zap.String("hash", hash), zap.Error(err))
 	} else {
 		logger.Info("download: ANNAS_SECRET_KEY unset — skipping fast_download")
-		annaErr = usererror.New("AUTH_REQUIRED",
-			"ANNAS_SECRET_KEY is not set — skipped the fast_download tier.")
+		annaErr = usererror.New(usererror.CodeAuthRequired,
+			"ANNAS_SECRET_KEY is not set, so Anna's Archive fast_download was skipped and no fallback source is enabled.")
 	}
 
 	// --- Tier 2: Libgen.li ---
 
-	if !cfg.LibgenEnabled {
-		// Fallback is disabled; surface the Anna's error (or the "auth
-		// required" stub when we didn't even try).
+	if !cfg.LibgenEnabled || ctx.Err() != nil {
 		return nil, annaErr
 	}
 
@@ -110,11 +185,11 @@ func Download(
 		// for end-users (it names the exact hash and mirror).
 		return nil, err
 	}
-	return writeAndResult(cfg.DownloadPath, filename, body, "libgen.li", logger)
+	return dst.save(body, SourceLibgen, logger)
 }
 
 // fetchFromAnna performs the Anna's fast_download flow and returns an open
-// body that the caller must close (via writeAndResult).
+// body that the caller must close.
 func fetchFromAnna(
 	ctx context.Context,
 	client *httpclient.Client,
@@ -122,47 +197,93 @@ func fetchFromAnna(
 	cfg *config.Config,
 	hash string,
 ) (io.ReadCloser, error) {
-	logger.Info("resolving download URL", zap.String("hash", hash))
-
 	downloadURL, err := api.ResolveDownloadURL(ctx, client, hash, cfg.SecretKey)
 	if err != nil {
 		return nil, fmt.Errorf("download: resolve URL for %s: %w", hash, err)
 	}
 
-	logger.Info("fetching file", zap.String("url", downloadURL))
+	logger.Info("fetching file", zap.String("hash", hash), zap.String("url", downloadURL))
 
 	resp, err := client.Get(ctx, downloadURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("download: fetch file: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
+		defer resp.Body.Close()
 		return nil, httpclient.StatusErrorFromResponse("download", downloadURL, resp)
 	}
 	return resp.Body, nil
 }
 
-// writeAndResult drains body to disk atomically and returns a DownloadResult
-// stamped with the source tier. The body is always closed before return.
-func writeAndResult(
-	downloadPath, filename string,
-	body io.ReadCloser,
-	source string,
-	logger *zap.Logger,
-) (*model.DownloadResult, error) {
+// target is a validated destination inside the download directory.
+type target struct {
+	dir      string
+	filename string
+}
+
+// newTarget validates the configured download directory and derives a safe
+// filename from title and format.
+func newTarget(cfg *config.Config, title, format string) (target, error) {
+	if cfg.DownloadPath == "" {
+		return target{}, errPathRequired()
+	}
+	info, err := os.Stat(cfg.DownloadPath)
+	if err != nil {
+		return target{}, usererror.Wrap(usererror.CodePathUnavailable,
+			"ANNAS_DOWNLOAD_PATH is not accessible. Check that the directory exists and is writable.", err)
+	}
+	if !info.IsDir() {
+		return target{}, usererror.New(usererror.CodePathUnavailable, "ANNAS_DOWNLOAD_PATH must be a directory.")
+	}
+	return target{dir: cfg.DownloadPath, filename: SanitizeFilename(title, format)}, nil
+}
+
+func (t target) path() string {
+	return filepath.Join(t.dir, t.filename)
+}
+
+// cached returns a result when a non-empty file already sits at the target
+// path, so repeat calls cost no upstream requests or quota. Otherwise nil.
+func (t target) cached(logger *zap.Logger) *model.DownloadResult {
+	info, err := os.Stat(t.path())
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return nil
+	}
+	logger.Info("download skipped — file already exists",
+		zap.String("path", t.path()), zap.Int64("size", info.Size()))
+	return &model.DownloadResult{
+		FilePath:       t.path(),
+		Message:        "File already exists — download skipped.",
+		AlreadyExisted: true,
+		Source:         SourceCache,
+	}
+}
+
+// save drains body to the target path atomically and returns a result stamped
+// with the source tier. The body is always closed before return.
+func (t target) save(body io.ReadCloser, source string, logger *zap.Logger) (*model.DownloadResult, error) {
 	defer body.Close()
 
-	filePath, err := AtomicWrite(downloadPath, filename, body)
+	filePath, err := AtomicWrite(t.dir, t.filename, body)
 	if err != nil {
-		return nil, usererror.Wrap("IO_ERROR",
+		// A failure while reading the response is a transport problem, not a
+		// disk problem — let the tool boundary classify it (timeout, etc.).
+		if readErr, ok := errors.AsType[*bodyReadError](err); ok {
+			return nil, fmt.Errorf("download: %s transfer interrupted: %w", source, readErr.err)
+		}
+		if errors.Is(err, errEmptyBody) {
+			return nil, usererror.Wrap(usererror.CodeUpstreamRejected,
+				fmt.Sprintf("The %s source returned an empty file. Try again later.", source), err)
+		}
+		return nil, usererror.Wrap(usererror.CodeIOError,
 			"Could not save the downloaded file. Check ANNAS_DOWNLOAD_PATH is writable and has free space.", err)
 	}
 	logger.Info("download complete",
 		zap.String("path", filePath), zap.String("source", source))
 
 	msg := "Downloaded successfully"
-	if source == "libgen.li" {
-		msg = "Downloaded successfully via libgen.li"
+	if source != SourceFastDownload {
+		msg = "Downloaded successfully via " + source
 	}
 	return &model.DownloadResult{
 		FilePath: filePath,
@@ -171,17 +292,7 @@ func writeAndResult(
 	}, nil
 }
 
-// IsConfigError reports whether err represents an operator/config problem
-// that fallback tiers cannot fix. Exported so tool handlers can decide
-// whether to bubble up or let the fallback cascade continue.
-func IsConfigError(err error) bool {
-	var ue *usererror.Error
-	if !errors.As(err, &ue) {
-		return false
-	}
-	switch ue.Code {
-	case "PATH_REQUIRED", "PATH_UNAVAILABLE", "INVALID_HASH", "INVALID_DOI":
-		return true
-	}
-	return false
+func errPathRequired() error {
+	return usererror.New(usererror.CodePathRequired,
+		"Downloads require a download path. Set ANNAS_DOWNLOAD_PATH in your MCP server configuration.")
 }

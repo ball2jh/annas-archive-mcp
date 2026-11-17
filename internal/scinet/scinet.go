@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strings"
 
+	doipkg "github.com/ball2jh/annas-archive-mcp/internal/doi"
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
@@ -43,13 +44,13 @@ var pdfSrcRE = regexp.MustCompile(`(?i)<iframe[^>]*\bsrc\s*=\s*["'](/storage/[^"
 // The caller is responsible for closing the returned body.
 func FetchPDF(ctx context.Context, client *httpclient.Client, baseURL, doi string) (io.ReadCloser, string, error) {
 	if strings.TrimSpace(doi) == "" {
-		return nil, "", usererror.New("INVALID_DOI", "DOI is required.")
+		return nil, "", usererror.New(usererror.CodeInvalidDOI, "DOI is required.")
 	}
 	if strings.TrimSpace(baseURL) == "" {
-		return nil, "", usererror.New("CONFIG", "SCINET_BASE_URL is empty.")
+		return nil, "", usererror.New(usererror.CodeConfig, "SCINET_BASE_URL is empty.")
 	}
 
-	pageURL := "https://" + baseURL + "/" + strings.TrimPrefix(doi, "/")
+	pageURL := "https://" + baseURL + "/" + doipkg.EscapePath(strings.TrimPrefix(strings.TrimSpace(doi), "/"))
 
 	resp, err := client.Get(ctx, pageURL, nil)
 	if err != nil {
@@ -62,14 +63,14 @@ func FetchPDF(ctx context.Context, client *httpclient.Client, baseURL, doi strin
 		return nil, "", fmt.Errorf("scinet: read page body: %w", readErr)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", usererror.Wrap("UPSTREAM_REJECTED",
+		return nil, "", usererror.Wrap(usererror.CodeUpstreamRejected,
 			fmt.Sprintf("Sci-Net returned HTTP %d for DOI %q.", resp.StatusCode, doi),
 			fmt.Errorf("HTTP %d", resp.StatusCode))
 	}
 
 	match := pdfSrcRE.FindSubmatch(body)
 	if match == nil {
-		return nil, "", usererror.New("NOT_FOUND_ON_SCINET",
+		return nil, "", usererror.New(usererror.CodeNotFoundOnScinet,
 			fmt.Sprintf("Sci-Net has no PDF for DOI %q. The article may need to be requested from members.", doi))
 	}
 	pdfPath := string(match[1])
@@ -85,9 +86,15 @@ func FetchPDF(ctx context.Context, client *httpclient.Client, baseURL, doi strin
 	}
 	if pdfResp.StatusCode != http.StatusOK {
 		_ = pdfResp.Body.Close()
-		return nil, "", usererror.Wrap("UPSTREAM_REJECTED",
+		return nil, "", usererror.Wrap(usererror.CodeUpstreamRejected,
 			fmt.Sprintf("Sci-Net storage returned HTTP %d for PDF of DOI %q.", pdfResp.StatusCode, doi),
 			fmt.Errorf("HTTP %d", pdfResp.StatusCode))
+	}
+
+	if httpclient.IsHTML(pdfResp) {
+		_ = pdfResp.Body.Close()
+		return nil, "", usererror.New(usererror.CodeUpstreamRejected,
+			fmt.Sprintf("Sci-Net returned a web page instead of the PDF for DOI %q.", doi))
 	}
 
 	return pdfResp.Body, filename, nil

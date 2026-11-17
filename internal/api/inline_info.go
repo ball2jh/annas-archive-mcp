@@ -80,7 +80,6 @@ func FetchStatsParallel(
 	var wg sync.WaitGroup
 
 	for _, h := range hashes {
-		h := h // capture loop variable
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

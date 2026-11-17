@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
+	"github.com/ball2jh/annas-archive-mcp/internal/model"
 	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
@@ -33,9 +34,6 @@ import (
 // Libgen accepts hex-case-insensitive md5 and alphanumeric session keys.
 // Match groups: 1 = md5 (echoed back), 2 = session key.
 var getKeyRE = regexp.MustCompile(`(?i)get\.php\?md5=([0-9a-f]{32})&key=([A-Z0-9]+)`)
-
-// hashRE validates incoming hashes before we ship them over the wire.
-var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 
 // FetchByHash resolves the given MD5 hash on libgen and returns an open
 // body for the file. The caller is responsible for closing the body.
@@ -50,16 +48,14 @@ var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{32}$`)
 // the caller's error policy (retry, report, etc.) can treat them as
 // transient. Use errors.As with *usererror.Error to check classification.
 func FetchByHash(ctx context.Context, client *httpclient.Client, baseURL, hash string) (io.ReadCloser, error) {
-	hash = strings.TrimSpace(hash)
-	if !hashRE.MatchString(hash) {
-		return nil, usererror.New("INVALID_HASH", "hash must be a 32-character MD5 hex string.")
+	// Libgen stores md5s in lowercase; Anna's Archive sometimes emits uppercase.
+	hashLower, ok := model.NormalizeHash(hash)
+	if !ok {
+		return nil, usererror.New(usererror.CodeInvalidHash, "hash must be a 32-character MD5 hex string.")
 	}
 	if strings.TrimSpace(baseURL) == "" {
-		return nil, usererror.New("CONFIG", "LIBGEN_BASE_URL is empty.")
+		return nil, usererror.New(usererror.CodeConfig, "LIBGEN_BASE_URL is empty.")
 	}
-	// Normalise the hash to lowercase; libgen stores md5s in lowercase and
-	// Anna's Archive sometimes emits uppercase.
-	hashLower := strings.ToLower(hash)
 
 	adsURL := "https://" + baseURL + "/ads.php?md5=" + hashLower
 	adsResp, err := client.Get(ctx, adsURL, nil)
@@ -69,18 +65,18 @@ func FetchByHash(ctx context.Context, client *httpclient.Client, baseURL, hash s
 	body, readErr := io.ReadAll(adsResp.Body)
 	_ = adsResp.Body.Close()
 	if readErr != nil {
-		return nil, usererror.Wrap("IO_ERROR",
+		return nil, usererror.Wrap(usererror.CodeIOError,
 			"Could not read libgen.li ads page body.", readErr)
 	}
 	if adsResp.StatusCode != http.StatusOK {
-		return nil, usererror.Wrap("UPSTREAM_REJECTED",
+		return nil, usererror.Wrap(usererror.CodeUpstreamRejected,
 			fmt.Sprintf("Libgen returned HTTP %d for hash %s.", adsResp.StatusCode, hashLower),
 			fmt.Errorf("HTTP %d", adsResp.StatusCode))
 	}
 
 	match := getKeyRE.FindSubmatch(body)
 	if match == nil {
-		return nil, usererror.New("NOT_FOUND_ON_LIBGEN",
+		return nil, usererror.New(usererror.CodeNotFoundOnLibgen,
 			fmt.Sprintf("Libgen has no copy of hash %s.", hashLower))
 	}
 	key := string(match[2])
@@ -92,9 +88,17 @@ func FetchByHash(ctx context.Context, client *httpclient.Client, baseURL, hash s
 	}
 	if getResp.StatusCode != http.StatusOK {
 		_ = getResp.Body.Close()
-		return nil, usererror.Wrap("UPSTREAM_REJECTED",
+		return nil, usererror.Wrap(usererror.CodeUpstreamRejected,
 			fmt.Sprintf("Libgen get.php returned HTTP %d for hash %s.", getResp.StatusCode, hashLower),
 			fmt.Errorf("HTTP %d", getResp.StatusCode))
+	}
+
+	if httpclient.IsHTML(getResp) {
+		// Libgen answers 200 with an error page when the session key has
+		// expired or the mirror has lost the file.
+		_ = getResp.Body.Close()
+		return nil, usererror.New(usererror.CodeUpstreamRejected,
+			fmt.Sprintf("Libgen returned a web page instead of the file for hash %s.", hashLower))
 	}
 
 	return getResp.Body, nil

@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -299,5 +300,87 @@ func TestDurationFormats(t *testing.T) {
 				t.Errorf("HTTPTimeout = %v, want %v", cfg.HTTPTimeout, tc.want)
 			}
 		})
+	}
+}
+
+// Hostnames pasted as URLs are reduced to the bare host the client expects.
+func TestHostNormalisation(t *testing.T) {
+	t.Setenv("ANNAS_BASE_URL", "https://mirror.example.com/")
+	t.Setenv("LIBGEN_BASE_URL", " libgen.example.com ")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if cfg.BaseURL != "mirror.example.com" {
+		t.Errorf("BaseURL = %q, want %q", cfg.BaseURL, "mirror.example.com")
+	}
+	if cfg.LibgenBaseURL != "libgen.example.com" {
+		t.Errorf("LibgenBaseURL = %q, want %q", cfg.LibgenBaseURL, "libgen.example.com")
+	}
+}
+
+func TestHostWithPathRejected(t *testing.T) {
+	for _, v := range []string{"mirror.example.com/books", "https://", "user@mirror.example.com"} {
+		t.Setenv("ANNAS_BASE_URL", v)
+		if _, err := config.Load(); err == nil {
+			t.Errorf("Load() expected error for ANNAS_BASE_URL=%q, got nil", v)
+		}
+	}
+}
+
+// MCP clients pass env values without a shell, so "~" must be expanded here.
+func TestDownloadPathExpansion(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("ANNAS_DOWNLOAD_PATH", "~/books")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if want := filepath.Join(home, "books"); cfg.DownloadPath != want {
+		t.Errorf("DownloadPath = %q, want %q", cfg.DownloadPath, want)
+	}
+}
+
+func TestRelativeDownloadPathMadeAbsolute(t *testing.T) {
+	t.Setenv("ANNAS_DOWNLOAD_PATH", "books")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if !filepath.IsAbs(cfg.DownloadPath) {
+		t.Errorf("DownloadPath = %q, want an absolute path", cfg.DownloadPath)
+	}
+}
+
+func TestBrowserSettings(t *testing.T) {
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if !cfg.BrowserEnabled {
+		t.Error("BrowserEnabled = false by default, want true")
+	}
+	if filepath.Base(cfg.SessionFile) != "session.json" {
+		t.Errorf("SessionFile = %q, want a default ending in session.json", cfg.SessionFile)
+	}
+
+	t.Setenv("ANNAS_BROWSER", "off")
+	t.Setenv("ANNAS_SESSION_FILE", "/tmp/custom/session.json")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if cfg.BrowserEnabled || cfg.SessionFile != "/tmp/custom/session.json" {
+		t.Errorf("BrowserEnabled = %v, SessionFile = %q; want false and the override", cfg.BrowserEnabled, cfg.SessionFile)
+	}
+
+	t.Setenv("ANNAS_BROWSER", "sometimes")
+	if _, err := config.Load(); err == nil {
+		t.Error("Load() expected error for an unknown ANNAS_BROWSER value, got nil")
 	}
 }

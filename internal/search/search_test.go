@@ -89,7 +89,7 @@ func TestSearchSuccess(t *testing.T) {
 	client := newSearchTestClient(t, srv)
 	logger := zaptest.NewLogger(t)
 
-	results, err := Search(context.Background(), client, logger, "python programming", model.ContentTypeBookAny, 3)
+	results, err := Search(context.Background(), client, logger, "python programming", model.ContentTypeBookAny, 3, Options{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestSearchInvalidContentType(t *testing.T) {
 	client := newSearchTestClient(t, srv)
 	logger := zaptest.NewLogger(t)
 
-	_, err := Search(context.Background(), client, logger, "python", model.ContentType("invalid_type"), 5)
+	_, err := Search(context.Background(), client, logger, "python", model.ContentType("invalid_type"), 5, Options{})
 	if err == nil {
 		t.Fatal("expected error for invalid content type, got nil")
 	}
@@ -168,7 +168,7 @@ func TestSearchEmptyResults(t *testing.T) {
 	client := newSearchTestClient(t, srv)
 	logger := zaptest.NewLogger(t)
 
-	results, err := Search(context.Background(), client, logger, "xyzzy not found", model.ContentTypeBookAny, 5)
+	results, err := Search(context.Background(), client, logger, "xyzzy not found", model.ContentTypeBookAny, 5, Options{})
 	if err != nil {
 		t.Fatalf("unexpected error for empty results: %v", err)
 	}
