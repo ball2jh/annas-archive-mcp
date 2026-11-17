@@ -20,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/ball2jh/annas-archive-mcp/internal/config"
+	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
 const (
@@ -38,6 +39,19 @@ const (
 	// memory. Real pages are well under 1 MB; this only guards against a
 	// misbehaving upstream.
 	maxBufferedBody = 32 << 20 // 32 MB
+
+	// maxUpstreamInFlight caps how many requests to the Anna's Archive host
+	// may be awaiting response headers at once. An agent that fires a dozen
+	// tool calls in parallel would otherwise send several dozen simultaneous
+	// requests (each search also fetches per-result stats) and get the whole
+	// batch rate-limited. Body transfers are not counted, so a long download
+	// never holds a slot.
+	maxUpstreamInFlight = 4
+
+	// maxRetryAfterWait is the longest server-requested Retry-After the client
+	// will sit out. Longer hints are returned to the caller straight away so a
+	// tool call reports "retry after 10m" instead of hanging for ten minutes.
+	maxRetryAfterWait = 30 * time.Second
 
 	// baseBackoff is the initial wait duration between retries.
 	baseBackoff = 1 * time.Second
@@ -65,6 +79,10 @@ type Client struct {
 	// request that was challenged while another one refreshed just retries.
 	refreshMu  sync.Mutex
 	sessionGen atomic.Int64
+
+	// upstreamSlots is a counting semaphore over requests to baseURL (see
+	// maxUpstreamInFlight).
+	upstreamSlots chan struct{}
 
 	// stallTimeout bounds how long a request may go without progress: first
 	// waiting for response headers, then inside any single body Read. It is
@@ -125,11 +143,12 @@ func newClient(hc *http.Client, baseURL string, logger *zap.Logger, maxRetries i
 		hc.Jar, _ = cookiejar.New(nil) // never fails with nil options
 	}
 	c := &Client{
-		http:         hc,
-		logger:       logger,
-		maxRetries:   maxRetries,
-		baseURL:      baseURL,
-		stallTimeout: stallTimeout,
+		http:          hc,
+		logger:        logger,
+		maxRetries:    maxRetries,
+		baseURL:       baseURL,
+		stallTimeout:  stallTimeout,
+		upstreamSlots: make(chan struct{}, maxUpstreamInFlight),
 	}
 	defaultUA := userAgent
 	c.userAgent.Store(&defaultUA)
@@ -258,6 +277,10 @@ func (c *Client) Do(ctx context.Context, req *http.Request) (*http.Response, err
 				StatusCode: resp.StatusCode,
 				RetryAfter: lastRetryAfter,
 			}
+			if lastRetryAfter > maxRetryAfterWait {
+				// Too long to sit out inside a tool call — report it instead.
+				return nil, fmt.Errorf("httpclient: not waiting out Retry-After: %w", lastErr)
+			}
 
 		default:
 			// 2xx, 3xx, or other 4xx — return as-is.
@@ -291,6 +314,15 @@ func (c *Client) recoverSession(ctx context.Context, gen int64) bool {
 // attempt performs a single request guarded by the stall watchdog. On success
 // the response body keeps the watchdog armed for the duration of each Read.
 func (c *Client) attempt(ctx context.Context, req *http.Request) (*http.Response, error) {
+	if req.URL.Host == c.baseURL {
+		select {
+		case c.upstreamSlots <- struct{}{}:
+			defer func() { <-c.upstreamSlots }()
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%s %s: %w", req.Method, sanitizeURL(req.URL), context.Cause(ctx))
+		}
+	}
+
 	if c.stallTimeout <= 0 {
 		resp, err := c.http.Do(c.prepare(ctx, req))
 		return resp, redactURLError(err)
@@ -405,6 +437,12 @@ func (c *Client) GetHTML(ctx context.Context, path string) (*goquery.Document, e
 		return nil, fmt.Errorf("httpclient: GetHTML %s: parse HTML: %w", path, err)
 	}
 
+	// A challenge page served with a 200 would otherwise be scraped as a real
+	// page and reported as "no results".
+	if hasDDoSGuardMarker([]byte(doc.Find("title").First().Text())) {
+		return nil, &StatusError{Operation: "GetHTML", Path: path, StatusCode: resp.StatusCode, DDoSGuard: true}
+	}
+
 	return doc, nil
 }
 
@@ -438,13 +476,19 @@ func (c *Client) GetJSONStatus(ctx context.Context, path string, headers map[str
 	if err != nil {
 		return nil, 0, fmt.Errorf("httpclient: GetJSON %s: %w", path, err)
 	}
-	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBufferedBody))
+	data, err := ReadPage(resp)
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("httpclient: GetJSON %s: read body: %w", path, err)
 	}
 	return data, resp.StatusCode, nil
+}
+
+// ReadPage reads a response that is expected to be a page or a JSON document
+// rather than a file, capped at maxBufferedBody, and closes the body.
+func ReadPage(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	return io.ReadAll(io.LimitReader(resp.Body, maxBufferedBody))
 }
 
 // IsHTML reports whether resp declares an HTML body. File endpoints that
@@ -520,4 +564,26 @@ func StatusErrorFromResponse(operation, path string, resp *http.Response) error 
 	statusErr := NewStatusError(operation, path, resp.StatusCode, sniffed)
 	statusErr.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
 	return statusErr
+}
+
+// SourceError names the upstream in failures that Do reports after exhausting
+// its retries. Without it the tool boundary would describe a rate limit or an
+// outage at a fallback source (Libgen, Sci-Net) as coming from Anna's Archive.
+// Errors that are not such a failure are returned unchanged.
+func SourceError(source string, err error) error {
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) || statusErr.DDoSGuard {
+		return err
+	}
+	switch {
+	case statusErr.StatusCode == http.StatusTooManyRequests:
+		msg := source + " rate-limited the request. Wait a bit and try again."
+		if statusErr.RetryAfter > 0 {
+			msg = fmt.Sprintf("%s rate-limited the request. Retry after %s.", source, statusErr.RetryAfter.Round(time.Second))
+		}
+		return usererror.Wrap(usererror.CodeRateLimited, msg, err)
+	case statusErr.StatusCode >= 500:
+		return usererror.Wrap(usererror.CodeUpstreamUnavailable, source+" is temporarily unavailable. Try again later.", err)
+	}
+	return err
 }

@@ -17,6 +17,7 @@ import (
 
 	"github.com/ball2jh/annas-archive-mcp/internal/config"
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
+	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 )
 
 // ---------------------------------------------------------------------------
@@ -717,4 +718,109 @@ func newDownloadTestClient(t *testing.T, srv *httptest.Server) *httpclient.Clien
 		Transport: srv.Client().Transport,
 	}
 	return httpclient.NewForTest(hc, srv.Listener.Addr().String(), logger)
+}
+
+// A lapsed membership must stay visible when Libgen cannot rescue the
+// download: it is the thing the user can actually fix.
+func TestDownloadReportsLapsedMembershipWhenLibgenFails(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef"
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/dyn/api/fast_download.json") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = io.WriteString(w, `{"download_url": null, "error": "Not a member"}`)
+			return
+		}
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		SecretKey:     "mysecret",
+		DownloadPath:  t.TempDir(),
+		LibgenBaseURL: srv.Listener.Addr().String(),
+		LibgenEnabled: true,
+		MaxRetries:    0,
+	}
+
+	_, err := Download(context.Background(), newDownloadTestClient(t, srv), zaptest.NewLogger(t), cfg, hash, "Thang", "pdf")
+	if !usererror.HasCode(err, usererror.CodeAuthInvalid) {
+		t.Fatalf("error = %v, want code %s", err, usererror.CodeAuthInvalid)
+	}
+	if !strings.Contains(err.Error(), "membership") {
+		t.Errorf("error %q does not mention the membership", err)
+	}
+}
+
+// When both sources fail, the reported error must be the one the caller can
+// act on, not simply whichever source was tried last.
+func TestBothFailedPicksTheActionableError(t *testing.T) {
+	libgenMissing := usererror.New(usererror.CodeNotFoundOnLibgen, "Libgen has no copy of hash x.")
+	libgenRejected := usererror.New(usererror.CodeUpstreamRejected, "Libgen returned HTTP 403 for hash x.")
+	rateLimited := fmt.Errorf("resolve: %w", &httpclient.StatusError{StatusCode: http.StatusTooManyRequests})
+
+	cases := []struct {
+		name      string
+		annaErr   error
+		libgenErr error
+		wantCode  string // "" = wantSame
+		wantSame  error
+		wantText  string
+	}{
+		{"lapsed membership", usererror.New(usererror.CodeAuthInvalid, "No membership."), libgenMissing, usererror.CodeAuthInvalid, nil, "Libgen"},
+		{"lapsed membership, libgen rejected", usererror.New(usererror.CodeAuthInvalid, "No membership."), libgenRejected, usererror.CodeAuthInvalid, nil, "Libgen"},
+		{"quota", usererror.New(usererror.CodeQuotaExhausted, "Quota reached."), libgenMissing, usererror.CodeQuotaExhausted, nil, "Libgen"},
+		{"in neither source", usererror.New(usererror.CodeNotFastDownloadable, "Download it manually at URL."), libgenMissing, usererror.CodeNotFastDownloadable, nil, "manually"},
+		{"no key", usererror.New(usererror.CodeAuthRequired, "No key."), libgenMissing, usererror.CodeNotFoundOnLibgen, nil, "ANNAS_SECRET_KEY"},
+		{"anna transient, libgen missing", rateLimited, libgenMissing, "", rateLimited, ""},
+		{"anna transient, libgen rejected", rateLimited, libgenRejected, "", libgenRejected, ""},
+		{"not fast-downloadable, libgen rejected", usererror.New(usererror.CodeNotFastDownloadable, "Manual."), libgenRejected, "", libgenRejected, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := bothFailed(context.Background(), tc.annaErr, tc.libgenErr)
+			if tc.wantCode == "" {
+				if got != tc.wantSame {
+					t.Fatalf("got %v, want %v", got, tc.wantSame)
+				}
+				return
+			}
+			if !usererror.HasCode(got, tc.wantCode) {
+				t.Fatalf("got %v, want code %s", got, tc.wantCode)
+			}
+			if !strings.Contains(got.Error(), tc.wantText) {
+				t.Errorf("message %q does not mention %q", got, tc.wantText)
+			}
+		})
+	}
+}
+
+// An HTML page from the fast-download host must not be saved as the file.
+func TestDownloadRejectsHTMLFromFastDownload(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef"
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/dyn/api/fast_download.json"):
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"download_url": %q}`, srv.URL+"/file")
+		case r.URL.Path == "/file":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = io.WriteString(w, "<html><body>Link expired</body></html>")
+		default:
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := &config.Config{SecretKey: "mysecret", DownloadPath: dir, LibgenEnabled: false}
+	_, err := Download(context.Background(), newDownloadTestClient(t, srv), zaptest.NewLogger(t), cfg, hash, "Thang", "pdf")
+	if !usererror.HasCode(err, usererror.CodeUpstreamRejected) {
+		t.Fatalf("error = %v, want %s", err, usererror.CodeUpstreamRejected)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("download dir has %d entries, want none", len(entries))
+	}
 }

@@ -54,13 +54,16 @@ func FetchPDF(ctx context.Context, client *httpclient.Client, baseURL, doi strin
 
 	resp, err := client.Get(ctx, pageURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("scinet: GET page %s: %w", pageURL, err)
+		return nil, "", httpclient.SourceError("Sci-Net", fmt.Errorf("scinet: GET page %s: %w", pageURL, err))
 	}
 	// Read the body right away — it's small (~4KB) and we don't need streaming.
-	body, readErr := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	body, readErr := httpclient.ReadPage(resp)
 	if readErr != nil {
 		return nil, "", fmt.Errorf("scinet: read page body: %w", readErr)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, "", usererror.New(usererror.CodeNotFoundOnScinet,
+			fmt.Sprintf("Sci-Net has no page for DOI %q.", doi))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", usererror.Wrap(usererror.CodeUpstreamRejected,
@@ -82,7 +85,7 @@ func FetchPDF(ctx context.Context, client *httpclient.Client, baseURL, doi strin
 
 	pdfResp, err := client.Get(ctx, pdfURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("scinet: GET pdf %s: %w", pdfURL, err)
+		return nil, "", httpclient.SourceError("Sci-Net", fmt.Errorf("scinet: GET pdf %s: %w", pdfURL, err))
 	}
 	if pdfResp.StatusCode != http.StatusOK {
 		_ = pdfResp.Body.Close()

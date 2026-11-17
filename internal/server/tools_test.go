@@ -17,6 +17,7 @@ import (
 	"github.com/ball2jh/annas-archive-mcp/internal/config"
 	"github.com/ball2jh/annas-archive-mcp/internal/httpclient"
 	"github.com/ball2jh/annas-archive-mcp/internal/model"
+	"github.com/ball2jh/annas-archive-mcp/internal/usererror"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -607,5 +608,15 @@ func TestSearchHandlerEmptyResultsAreNotNull(t *testing.T) {
 	}
 	if out.Results == nil || out.Count != 0 {
 		t.Fatalf("out = %+v, want empty non-nil Results", out)
+	}
+}
+
+func TestToolErrorReportsLegalBlock(t *testing.T) {
+	err := toolError(toolSearch, &httpclient.StatusError{StatusCode: http.StatusUnavailableForLegalReasons})
+	if !usererror.HasCode(err, usererror.CodeUpstreamBlocked) {
+		t.Fatalf("error = %v, want %s", err, usererror.CodeUpstreamBlocked)
+	}
+	if !strings.Contains(err.Error(), "ANNAS_BASE_URL") {
+		t.Errorf("message %q does not point at ANNAS_BASE_URL", err)
 	}
 }

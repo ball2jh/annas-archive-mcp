@@ -258,3 +258,16 @@ func TestIframeRegex(t *testing.T) {
 		})
 	}
 }
+
+// A 404 from the DOI page means Sci-Net does not have the article.
+func TestFetchPDF_PageNotFound(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	_, _, err := FetchPDF(context.Background(), newTestClient(t, srv), srv.Listener.Addr().String(), "10.1016/j.jaad.2025.08.079")
+	if !usererror.HasCode(err, usererror.CodeNotFoundOnScinet) {
+		t.Fatalf("error = %v, want %s", err, usererror.CodeNotFoundOnScinet)
+	}
+}

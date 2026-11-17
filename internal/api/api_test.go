@@ -348,11 +348,14 @@ func chainContains(err error, sub string) bool {
 func TestResolveDownloadURLStopsOnDefinitiveError(t *testing.T) {
 	cases := []struct {
 		name     string
+		status   int
 		apiError string
 		wantCode string
 	}{
-		{"invalid key", "Invalid secret key", usererror.CodeAuthInvalid},
-		{"quota", "No downloads left: daily download limit reached", usererror.CodeQuotaExhausted},
+		{"invalid key", http.StatusOK, "Invalid secret key", usererror.CodeAuthInvalid},
+		{"quota", http.StatusOK, "No downloads left: daily download limit reached", usererror.CodeQuotaExhausted},
+		// The live API answers a lapsed membership with a 403.
+		{"lapsed membership", http.StatusForbidden, "Not a member", usererror.CodeAuthInvalid},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -360,6 +363,7 @@ func TestResolveDownloadURLStopsOnDefinitiveError(t *testing.T) {
 			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
 				fmt.Fprintf(w, `{"download_url": null, "error": %q}`, tc.apiError)
 			}))
 			defer srv.Close()

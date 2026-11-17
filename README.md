@@ -76,6 +76,14 @@ Tool execution errors are returned as MCP tool errors with stable codes, so agen
 - Upstream: `[UPSTREAM_BLOCKED]`, `[UPSTREAM_REJECTED]`, `[UPSTREAM_UNAVAILABLE]`, `[UPSTREAM_API_ERROR]`, `[NOT_FOUND]`, `[NOT_FOUND_ON_LIBGEN]`, `[NOT_FOUND_ON_SCINET]`, `[NOT_FAST_DOWNLOADABLE]`
 - Unclassified (one per tool): `[SEARCH_FAILED]`, `[DOWNLOAD_FAILED]`, `[DOI_DOWNLOAD_FAILED]`, `[DOI_LOOKUP_FAILED]`, `[DETAILS_FAILED]`
 
+A few codes worth knowing:
+
+- `[AUTH_INVALID]` means Anna's Archive rejected `ANNAS_SECRET_KEY`, or the key's account has no active membership. It is reported even when the Libgen fallback was tried and failed, because the key is what you can fix.
+- `[RATE_LIMITED]` and `[UPSTREAM_UNAVAILABLE]` name the source that was responsible (Anna's Archive, Libgen or Sci-Net). When the server asks for a wait longer than 30 seconds, the tool returns straight away with the wait in the message instead of blocking.
+- `[UPSTREAM_BLOCKED]` covers both the DDoS-Guard browser check and a mirror that is blocked on your network (HTTP 451); the message says which.
+
+At most four requests to Anna's Archive are in flight at once, so a burst of parallel tool calls is queued rather than rate-limited.
+
 Internal URLs and raw upstream error details are logged to stderr for debugging but never returned to the caller. `ANNAS_SECRET_KEY` is redacted from logs as well.
 
 ## Install
@@ -139,7 +147,7 @@ All via environment variables:
 | `ANNAS_HTTP_TIMEOUT` | No | `30s` | How long a request may stall (no response, or no new data) before it is abandoned. Not a limit on total download time. |
 | `ANNAS_STATS_TIMEOUT` | No | `5s` | Time allowed for community stats; results are returned without stats when it elapses |
 | `ANNAS_MAX_RETRIES` | No | `3` | Retry attempts on network errors, 429 and 5xx |
-| `ANNAS_MAX_CONCURRENCY` | No | `10` | Parallel community-stats request cap |
+| `ANNAS_MAX_CONCURRENCY` | No | `10` | Parallel community-stats request cap per tool call (requests to Anna's Archive are further limited to four in flight overall) |
 | `ANNAS_TOOL_RATE_LIMIT_PER_MINUTE` | No | `60` | Per-tool local call cap. Set `0` to disable. |
 | `ANNAS_LOG_LEVEL` | No | `warn` | Log level (`debug`, `info`, `warn`, `error`) |
 | `ANNAS_BROWSER` | No | `auto` | `auto` opens Chrome when needed to pass the browser check; `off` never does |

@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -252,22 +251,19 @@ func toolError(tool string, err error) error {
 			return usererror.New(usererror.CodeUpstreamBlocked, "Anna's Archive is showing its DDoS-Guard browser check and the server could not pass it. Passing it needs Google Chrome or Chromium on a machine with a desktop session (set ANNAS_CHROME_PATH if it is not found, and make sure ANNAS_BROWSER is not off). See the server log for the reason, then try again.")
 		}
 
+		// Rate limits and outages. Fallback sources name themselves before
+		// their errors get here, so what is left is Anna's Archive's.
+		if errors.As(httpclient.SourceError("Anna's Archive", statusErr), &userErr) {
+			return userErr
+		}
+
 		switch statusErr.StatusCode {
-		case http.StatusTooManyRequests:
-			msg := "Anna's Archive rate-limited the request. Wait a bit and try again."
-			if statusErr.RetryAfter > 0 {
-				msg = fmt.Sprintf("Anna's Archive rate-limited the request. Retry after %s.",
-					statusErr.RetryAfter.Round(time.Second))
-			}
-			return usererror.New(usererror.CodeRateLimited, msg)
 		case http.StatusNotFound:
 			return usererror.New(usererror.CodeNotFound, notFoundMessage(tool))
 		case http.StatusUnauthorized, http.StatusForbidden:
 			return usererror.New(usererror.CodeUpstreamRejected, rejectedMessage(tool))
-		}
-
-		if statusErr.StatusCode >= 500 {
-			return usererror.New(usererror.CodeUpstreamUnavailable, "Anna's Archive is temporarily unavailable. Try again later.")
+		case http.StatusUnavailableForLegalReasons:
+			return usererror.New(usererror.CodeUpstreamBlocked, "This Anna's Archive mirror is blocked on your network or in your region (HTTP 451). Configure another mirror with ANNAS_BASE_URL.")
 		}
 	}
 

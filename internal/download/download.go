@@ -180,12 +180,50 @@ func fetchByHash(
 	logger.Info("download: trying libgen.li fallback", zap.String("hash", hash))
 	body, err := libgen.FetchByHash(ctx, client, cfg.LibgenBaseURL, hash)
 	if err != nil {
-		// Return the libgen error directly. When Anna's also failed we lose
-		// the original cause here, but the libgen error is more actionable
-		// for end-users (it names the exact hash and mirror).
-		return nil, err
+		return nil, bothFailed(ctx, annaErr, err)
 	}
 	return dst.save(body, SourceLibgen, logger)
+}
+
+// bothFailed picks the error to report when fast_download and Libgen have
+// both failed. Reporting only the Libgen error, as a plain fallback chain
+// would, hides the cause the caller can act on.
+func bothFailed(ctx context.Context, annaErr, libgenErr error) error {
+	if ctx.Err() != nil {
+		return libgenErr
+	}
+	// Either may be nil: not every failure carries a user-facing code.
+	annaUser, _ := errors.AsType[*usererror.Error](annaErr)
+	libgenUser, _ := errors.AsType[*usererror.Error](libgenErr)
+	libgenMissing := libgenUser != nil && libgenUser.Code == usererror.CodeNotFoundOnLibgen
+	annaCode := ""
+	if annaUser != nil {
+		annaCode = annaUser.Code
+	}
+
+	switch {
+	// A rejected key or an exhausted quota is something the user can fix, and
+	// fixing it is usually what makes the file downloadable.
+	case annaCode == usererror.CodeAuthInvalid, annaCode == usererror.CodeQuotaExhausted:
+		return usererror.Wrap(annaCode, annaUser.Message+" The Libgen fallback could not provide this file either.", libgenErr)
+
+	// Neither source carries the file: the fast_download message already
+	// points at the page to download it from by hand.
+	case libgenMissing && annaCode == usererror.CodeNotFastDownloadable:
+		return usererror.Wrap(annaCode, annaUser.Message+" Libgen has no copy either.", libgenErr)
+
+	// No key, and the free source lacks the file: a membership key is what
+	// would make it downloadable.
+	case libgenMissing && annaCode == usererror.CodeAuthRequired:
+		return usererror.Wrap(libgenUser.Code, libgenUser.Message+" Anna's Archive fast downloads were not tried because ANNAS_SECRET_KEY is not set; a member key may make this file downloadable.", annaErr)
+
+	// Libgen lacks the file and fast_download failed for a passing reason
+	// (rate limit, outage, timeout): that reason is what a retry can fix.
+	case libgenMissing:
+		return annaErr
+	}
+	// Otherwise the Libgen error is the more specific one.
+	return libgenErr
 }
 
 // fetchFromAnna performs the Anna's fast_download flow and returns an open
@@ -211,6 +249,12 @@ func fetchFromAnna(
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		return nil, httpclient.StatusErrorFromResponse("download", downloadURL, resp)
+	}
+	if httpclient.IsHTML(resp) {
+		// An error or challenge page, not the file — never save it as a book.
+		_ = resp.Body.Close()
+		return nil, usererror.New(usererror.CodeUpstreamRejected,
+			"Anna's Archive returned a web page instead of the file. Try again later.")
 	}
 	return resp.Body, nil
 }

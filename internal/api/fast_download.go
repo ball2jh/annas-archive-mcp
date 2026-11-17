@@ -51,11 +51,11 @@ func ResolveDownloadURL(ctx context.Context, client *httpclient.Client, hash, se
 
 // resolveSingle performs a single fast_download.json request for the given
 // domain_index. It returns the download URL on success, or an error describing
-// why the request failed (including API-level error messages).
+// why the request failed.
 //
-// The Anna's Archive fast_download API returns structured JSON errors on both
-// 200 and 400 responses, so we read the body regardless of status and parse
-// the "error" field.
+// The API reports its own failures as JSON with an "error" string, on several
+// statuses (400 for a bad index, 403 for "Not a member", ...). That message is
+// what the caller can act on, so it takes precedence over the status code.
 func resolveSingle(ctx context.Context, client *httpclient.Client, hash, secretKey string, domainIndex int) (string, error) {
 	params := url.Values{}
 	params.Set("md5", hash)
@@ -69,51 +69,54 @@ func resolveSingle(ctx context.Context, client *httpclient.Client, hash, secretK
 		return "", fmt.Errorf("domain_index=%d: %w", domainIndex, err)
 	}
 
-	// 401/403/404/429/5xx — treat as HTTP failure (body may not be JSON).
-	// 200 and 400 both carry the structured JSON body we need to inspect.
-	if status != http.StatusOK && status != http.StatusBadRequest {
-		return "", httpclient.NewStatusError("fast_download", sanitizeAPIPath(hash, domainIndex), status, data)
-	}
-
 	var raw fastDownloadResponse
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return "", fmt.Errorf("domain_index=%d: parse JSON from status %d: %w", domainIndex, status, err)
-	}
-
-	// API signals failure via a non-empty error string and null download_url.
-	if raw.Error != "" {
-		err := errors.New(raw.Error)
-		lower := strings.ToLower(raw.Error)
-		switch {
-		case strings.Contains(lower, "secret key"):
-			return "", usererror.Wrap(usererror.CodeAuthInvalid,
-				"Anna's Archive rejected ANNAS_SECRET_KEY. Update the key in your MCP configuration.", err)
-		case strings.Contains(lower, "daily download limit"),
-			strings.Contains(lower, "quota"),
-			strings.Contains(lower, "limit reached"):
-			return "", usererror.Wrap(usererror.CodeQuotaExhausted,
-				"Anna's Archive daily download quota reached. The limit resets every 24 hours; higher donation tiers have larger quotas.", err)
-		case strings.Contains(lower, "invalid domain_index"),
-			strings.Contains(lower, "invalid path_index"):
-			// The file isn't in any of Anna's fast_download mirrors — it's only
-			// reachable via external collections (Libgen.li, SciNet, Z-Library,
-			// etc.). Give the user a direct link to the file's page so they can
-			// download manually.
-			return "", usererror.Wrap(usererror.CodeNotFastDownloadable,
-				fmt.Sprintf("This file is not available via Anna's Archive's fast_download API; it lives in an external collection (Libgen, SciNet, Z-Library, etc.) that the API cannot proxy. Download it manually at https://%s/md5/%s.", client.BaseURL(), hash),
-				err)
-		}
-		// Unknown API error — surface the raw message so the user learns
-		// something actionable instead of the opaque fallback.
-		return "", usererror.Wrap(usererror.CodeUpstreamApiError,
-			fmt.Sprintf("Anna's Archive API error: %s", raw.Error), err)
-	}
-
-	if raw.DownloadURL == nil || *raw.DownloadURL == "" {
+	parseErr := json.Unmarshal(data, &raw) // leaves raw empty on failure
+	switch {
+	case raw.Error != "":
+		return "", apiError(client.BaseURL(), hash, raw.Error)
+	case status != http.StatusOK:
+		// No API error to go on (an HTML error page, say): a plain HTTP failure.
+		return "", httpclient.NewStatusError("fast_download", sanitizeAPIPath(hash, domainIndex), status, data)
+	case parseErr != nil:
+		return "", fmt.Errorf("domain_index=%d: parse JSON: %w", domainIndex, parseErr)
+	case raw.DownloadURL == nil || *raw.DownloadURL == "":
 		return "", fmt.Errorf("domain_index=%d: download_url is empty", domainIndex)
 	}
-
 	return *raw.DownloadURL, nil
+}
+
+// apiError classifies an error message from the fast_download API.
+func apiError(baseURL, hash, message string) error {
+	cause := errors.New(message)
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "secret key"):
+		return usererror.Wrap(usererror.CodeAuthInvalid,
+			"Anna's Archive rejected ANNAS_SECRET_KEY. Update the key in your MCP configuration.", cause)
+	case strings.Contains(lower, "not a member"):
+		// The key is valid but its account's membership has lapsed (or it
+		// never had one).
+		return usererror.Wrap(usererror.CodeAuthInvalid,
+			"The Anna's Archive account for ANNAS_SECRET_KEY has no active membership, so fast downloads are unavailable. Renew the membership or use a key from a member account.", cause)
+	case strings.Contains(lower, "daily download limit"),
+		strings.Contains(lower, "quota"),
+		strings.Contains(lower, "limit reached"):
+		return usererror.Wrap(usererror.CodeQuotaExhausted,
+			"Anna's Archive daily download quota reached. The limit resets every 24 hours; higher donation tiers have larger quotas.", cause)
+	case strings.Contains(lower, "invalid domain_index"),
+		strings.Contains(lower, "invalid path_index"):
+		// The file isn't in any of Anna's fast_download mirrors — it's only
+		// reachable via external collections (Libgen.li, SciNet, Z-Library,
+		// etc.). Give the user a direct link to the file's page so they can
+		// download manually.
+		return usererror.Wrap(usererror.CodeNotFastDownloadable,
+			fmt.Sprintf("This file is not available via Anna's Archive's fast_download API; it lives in an external collection (Libgen, SciNet, Z-Library, etc.) that the API cannot proxy. Download it manually at https://%s/md5/%s.", baseURL, hash),
+			cause)
+	}
+	// Unknown API error — surface the raw message so the user learns
+	// something actionable instead of the opaque fallback.
+	return usererror.Wrap(usererror.CodeUpstreamApiError,
+		fmt.Sprintf("Anna's Archive API error: %s", message), cause)
 }
 
 // sanitizeAPIPath returns a redacted /dyn/api/fast_download.json URL for

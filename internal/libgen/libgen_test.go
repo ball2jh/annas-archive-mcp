@@ -276,3 +276,36 @@ func TestGetKeyRegex(t *testing.T) {
 		})
 	}
 }
+
+// A 404 from the ads page means Libgen does not have the file; it is not a
+// rejection.
+func TestFetchByHash_AdsNotFound(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	_, err := FetchByHash(context.Background(), newTestClient(t, srv), srv.Listener.Addr().String(),
+		"4693089fb653fcaab65ba10d800593ea")
+	if !usererror.HasCode(err, usererror.CodeNotFoundOnLibgen) {
+		t.Fatalf("error = %v, want %s", err, usererror.CodeNotFoundOnLibgen)
+	}
+}
+
+// A Libgen outage must be reported as Libgen's, not Anna's Archive's.
+func TestFetchByHash_OutageNamesLibgen(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	_, err := FetchByHash(context.Background(), newTestClient(t, srv), srv.Listener.Addr().String(),
+		"4693089fb653fcaab65ba10d800593ea")
+	var ue *usererror.Error
+	if !errors.As(err, &ue) || ue.Code != usererror.CodeUpstreamUnavailable {
+		t.Fatalf("error = %v, want %s", err, usererror.CodeUpstreamUnavailable)
+	}
+	if !strings.Contains(ue.Message, "Libgen") {
+		t.Errorf("message %q does not name Libgen", ue.Message)
+	}
+}

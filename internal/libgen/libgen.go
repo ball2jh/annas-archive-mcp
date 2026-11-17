@@ -60,13 +60,15 @@ func FetchByHash(ctx context.Context, client *httpclient.Client, baseURL, hash s
 	adsURL := "https://" + baseURL + "/ads.php?md5=" + hashLower
 	adsResp, err := client.Get(ctx, adsURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("libgen: GET ads %s: %w", adsURL, err)
+		return nil, httpclient.SourceError("Libgen", fmt.Errorf("libgen: GET ads %s: %w", adsURL, err))
 	}
-	body, readErr := io.ReadAll(adsResp.Body)
-	_ = adsResp.Body.Close()
+	body, readErr := httpclient.ReadPage(adsResp)
 	if readErr != nil {
 		return nil, usererror.Wrap(usererror.CodeIOError,
 			"Could not read libgen.li ads page body.", readErr)
+	}
+	if adsResp.StatusCode == http.StatusNotFound {
+		return nil, errNotFound(hashLower)
 	}
 	if adsResp.StatusCode != http.StatusOK {
 		return nil, usererror.Wrap(usererror.CodeUpstreamRejected,
@@ -76,15 +78,14 @@ func FetchByHash(ctx context.Context, client *httpclient.Client, baseURL, hash s
 
 	match := getKeyRE.FindSubmatch(body)
 	if match == nil {
-		return nil, usererror.New(usererror.CodeNotFoundOnLibgen,
-			fmt.Sprintf("Libgen has no copy of hash %s.", hashLower))
+		return nil, errNotFound(hashLower)
 	}
 	key := string(match[2])
 
 	getURL := "https://" + baseURL + "/get.php?md5=" + hashLower + "&key=" + key
 	getResp, err := client.Get(ctx, getURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("libgen: GET file %s: %w", getURL, err)
+		return nil, httpclient.SourceError("Libgen", fmt.Errorf("libgen: GET file %s: %w", getURL, err))
 	}
 	if getResp.StatusCode != http.StatusOK {
 		_ = getResp.Body.Close()
@@ -102,4 +103,9 @@ func FetchByHash(ctx context.Context, client *httpclient.Client, baseURL, hash s
 	}
 
 	return getResp.Body, nil
+}
+
+func errNotFound(hash string) error {
+	return usererror.New(usererror.CodeNotFoundOnLibgen,
+		fmt.Sprintf("Libgen has no copy of hash %s.", hash))
 }
